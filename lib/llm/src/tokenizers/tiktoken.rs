@@ -150,7 +150,7 @@ fn detect_bpe_pattern(directory: &Path) -> Result<&'static str> {
     })?;
 
     match model_type.as_str() {
-        "kimi" | "kimi_k2" | "kimi_k25" => Ok(KIMI_PATTERN),
+        "kimi" | "kimi_k2" | "kimi_k25" | "deepseek_v3" => Ok(KIMI_PATTERN),
         _ => Err(Error::msg(format!(
             "Unsupported tiktoken model_type '{model_type}'. \
              Currently supported: kimi, kimi_k2, kimi_k25. \
