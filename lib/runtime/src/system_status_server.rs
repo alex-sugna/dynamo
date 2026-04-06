@@ -8,6 +8,7 @@ use crate::config::HealthStatus;
 use crate::config::environment_names::logging as env_logging;
 use crate::config::environment_names::runtime::canary as env_canary;
 use crate::config::environment_names::runtime::system as env_system;
+use crate::instances::list_all_instances;
 use crate::logging::make_request_span;
 use crate::metrics::MetricsHierarchy;
 use crate::traits::DistributedRuntimeProvider;
@@ -24,10 +25,75 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
+
+/// Environment variable for the frontend URL (e.g., "http://localhost:8000")
+const FRONTEND_URL_ENV: &str = "DYN_FRONTEND_URL";
+/// Environment variable for the model name to use in health checks
+const HEALTH_CHECK_MODEL_ENV: &str = "DYN_HEALTH_CHECK_MODEL";
+/// Environment variable for e2e health check timeout (seconds)
+const E2E_HEALTH_CHECK_TIMEOUT_ENV: &str = "DYN_E2E_HEALTH_CHECK_TIMEOUT";
+/// Environment variable for how long to cache a healthy status before re-checking (seconds)
+const E2E_LAST_HEALTHY_TIMEOUT_ENV: &str = "DYN_E2E_LAST_HEALTHY_TIMEOUT";
+/// Environment variable for the prefill component name (default: "prefill")
+const PREFILL_COMPONENT_NAME_ENV: &str = "DYN_PREFILL_COMPONENT_NAME";
+/// Default prefill component name
+const DEFAULT_PREFILL_COMPONENT_NAME: &str = "prefill";
+/// Default e2e health check timeout (30 seconds)
+const DEFAULT_E2E_HEALTH_CHECK_TIMEOUT_SECS: u64 = 30;
+/// Default last healthy cache timeout (10 seconds)
+const DEFAULT_E2E_LAST_HEALTHY_TIMEOUT_SECS: u64 = 10;
+
+/// Get the e2e health check timeout from environment or default
+fn get_e2e_health_check_timeout() -> Duration {
+    std::env::var(E2E_HEALTH_CHECK_TIMEOUT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_E2E_HEALTH_CHECK_TIMEOUT_SECS))
+}
+
+/// Get the last healthy cache timeout from environment or default
+fn get_e2e_last_healthy_timeout() -> Duration {
+    std::env::var(E2E_LAST_HEALTHY_TIMEOUT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_E2E_LAST_HEALTHY_TIMEOUT_SECS))
+}
+
+/// State for worker e2e health checks
+pub struct WorkerE2EHealthState {
+    /// Last successful e2e health check timestamp
+    last_healthy: RwLock<Option<Instant>>,
+    /// Lock to prevent concurrent health checks
+    health_lock: Mutex<()>,
+    /// HTTP client for making requests to frontend
+    http_client: reqwest::Client,
+}
+
+impl WorkerE2EHealthState {
+    pub fn new() -> Self {
+        Self {
+            last_healthy: RwLock::new(None),
+            health_lock: Mutex::new(()),
+            http_client: reqwest::Client::builder()
+                .timeout(get_e2e_health_check_timeout())
+                .build()
+                .expect("Failed to create HTTP client"),
+        }
+    }
+}
+
+impl Default for WorkerE2EHealthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// System status server information containing socket address and handle
 #[derive(Debug)]
@@ -156,6 +222,9 @@ pub async fn spawn_system_status_server(
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
 
+    // Create e2e health check state for worker-level health checks
+    let e2e_health_state = Arc::new(WorkerE2EHealthState::new());
+
     let mut app = Router::new()
         .route(
             &health_path,
@@ -183,6 +252,22 @@ pub async fn spawn_system_status_server(
             get({
                 let state = Arc::clone(&server_state);
                 move || metadata_handler(state)
+            }),
+        )
+        .route(
+            "/health/prefill",
+            get({
+                let state = Arc::clone(&server_state);
+                let e2e_state = Arc::clone(&e2e_health_state);
+                move || prefill_e2e_health_handler(state, e2e_state)
+            }),
+        )
+        .route(
+            "/health/decode",
+            get({
+                let state = Arc::clone(&server_state);
+                let e2e_state = Arc::clone(&e2e_health_state);
+                move || decode_e2e_health_handler(state, e2e_state)
             }),
         )
         .route(
@@ -611,6 +696,768 @@ async fn engine_route_handler(
                 json!({
                     "error": "Handler error",
                     "message": format!("{}", e)
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// E2E health check handler for prefill workers
+/// Makes an HTTP request to the frontend to trigger a full e2e generation
+#[tracing::instrument(skip_all, level = "debug")]
+async fn prefill_e2e_health_handler(
+    state: Arc<SystemStatusState>,
+    e2e_state: Arc<WorkerE2EHealthState>,
+) -> impl IntoResponse {
+    worker_e2e_health_check(state, e2e_state, "prefill").await
+}
+
+/// E2E health check handler for decode workers
+/// Tries multiple prefill workers until one succeeds
+#[tracing::instrument(skip_all, level = "debug")]
+async fn decode_e2e_health_handler(
+    state: Arc<SystemStatusState>,
+    e2e_state: Arc<WorkerE2EHealthState>,
+) -> impl IntoResponse {
+    decode_e2e_health_check_with_prefill_fallback(state, e2e_state).await
+}
+
+/// Decode worker e2e health check that tries multiple prefill workers
+/// Returns healthy if ANY prefill worker succeeds (since decode is working)
+/// Returns unhealthy only if ALL prefill workers fail
+async fn decode_e2e_health_check_with_prefill_fallback(
+    state: Arc<SystemStatusState>,
+    e2e_state: Arc<WorkerE2EHealthState>,
+) -> impl IntoResponse {
+    let last_healthy_timeout = get_e2e_last_healthy_timeout();
+
+    // Get this decode worker's instance_id for logging
+    let decode_instance_id = state.drt().connection_id();
+    tracing::info!(
+        "[decode e2e health] Starting health check (decode_instance_id={}, last_healthy_timeout={:?})",
+        decode_instance_id,
+        last_healthy_timeout
+    );
+
+    // Acquire lock to prevent concurrent health checks
+    let _guard = e2e_state.health_lock.lock().await;
+    tracing::info!("[decode e2e health] Acquired health check lock");
+
+    // Check if recent health check is still valid (cached)
+    {
+        let last_healthy = e2e_state.last_healthy.read().await;
+        if let Some(last) = *last_healthy {
+            let age = last.elapsed();
+            tracing::info!(
+                "[decode e2e health] Last healthy check was {:?} ago (timeout: {:?})",
+                age,
+                last_healthy_timeout
+            );
+            if age < last_healthy_timeout {
+                tracing::info!(
+                    "[decode e2e health] Returning cached healthy response (age: {:?})",
+                    age
+                );
+                return (
+                    StatusCode::OK,
+                    json!({
+                        "status": "healthy",
+                        "worker_type": "decode",
+                        "decode_instance_id": decode_instance_id,
+                        "cached": true,
+                        "last_check_age_secs": age.as_secs_f64()
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+            }
+        } else {
+            tracing::info!("[decode e2e health] No previous healthy check recorded");
+        }
+    }
+
+    // Check if a recent user request completed successfully (active traffic = healthy)
+    {
+        let last_req_age = state.drt().system_health().lock().last_successful_request_age();
+        if let Some(age) = last_req_age {
+            if age < last_healthy_timeout {
+                tracing::info!(
+                    "[decode e2e health] Active traffic detected: last successful request was {:?} ago, returning healthy",
+                    age
+                );
+                return (
+                    StatusCode::OK,
+                    json!({
+                        "status": "healthy",
+                        "worker_type": "decode",
+                        "decode_instance_id": decode_instance_id,
+                        "cached": true,
+                        "source": "active_traffic",
+                        "last_request_age_secs": age.as_secs_f64()
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Get frontend URL from environment
+    let frontend_url = match std::env::var(FRONTEND_URL_ENV) {
+        Ok(url) => {
+            tracing::info!("[decode e2e health] Frontend URL: {}", url);
+            url
+        }
+        Err(_) => {
+            tracing::warn!(
+                "[decode e2e health] Skipped: {} not set",
+                FRONTEND_URL_ENV
+            );
+            return (
+                StatusCode::OK,
+                json!({
+                    "status": "healthy",
+                    "worker_type": "decode",
+                    "decode_instance_id": decode_instance_id,
+                    "e2e_check": "skipped",
+                    "reason": format!("{} not configured", FRONTEND_URL_ENV)
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    // Get model name from environment
+    let model = match std::env::var(HEALTH_CHECK_MODEL_ENV) {
+        Ok(m) => {
+            tracing::info!("[decode e2e health] Model: {}", m);
+            m
+        }
+        Err(_) => {
+            tracing::warn!(
+                "[decode e2e health] Skipped: {} not set",
+                HEALTH_CHECK_MODEL_ENV
+            );
+            return (
+                StatusCode::OK,
+                json!({
+                    "status": "healthy",
+                    "worker_type": "decode",
+                    "decode_instance_id": decode_instance_id,
+                    "e2e_check": "skipped",
+                    "reason": format!("{} not configured", HEALTH_CHECK_MODEL_ENV)
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    // Get prefill worker instance IDs - either from environment or auto-discovery
+    // Format for env var: comma-separated list of instance IDs, e.g., "123,456,789"
+    let prefill_instance_ids: Vec<u64> = match std::env::var("DYN_PREFILL_INSTANCE_IDS") {
+        Ok(ids_str) => {
+            let ids: Vec<u64> = ids_str
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u64>().ok())
+                .collect();
+            tracing::info!(
+                "[decode e2e health] DYN_PREFILL_INSTANCE_IDS configured with {} prefill workers: {:?}",
+                ids.len(),
+                ids
+            );
+            ids
+        }
+        Err(_) => {
+            // Auto-discover prefill workers from the discovery service
+            tracing::info!(
+                "[decode e2e health] DYN_PREFILL_INSTANCE_IDS not set, auto-discovering prefill workers..."
+            );
+
+            let prefill_component_name = std::env::var(PREFILL_COMPONENT_NAME_ENV)
+                .unwrap_or_else(|_| DEFAULT_PREFILL_COMPONENT_NAME.to_string());
+
+            tracing::info!(
+                "[decode e2e health] Looking for prefill workers with component name: {}",
+                prefill_component_name
+            );
+
+            match list_all_instances(state.drt().discovery()).await {
+                Ok(instances) => {
+                    let prefill_ids: Vec<u64> = instances
+                        .iter()
+                        .filter(|instance| instance.component == prefill_component_name)
+                        .map(|instance| instance.instance_id)
+                        .collect();
+
+                    if prefill_ids.is_empty() {
+                        tracing::warn!(
+                            "[decode e2e health] No prefill workers found with component name '{}'. Found {} total instances.",
+                            prefill_component_name,
+                            instances.len()
+                        );
+                        // Log what components we did find for debugging
+                        let components: std::collections::HashSet<_> = instances.iter().map(|i| i.component.as_str()).collect();
+                        tracing::info!(
+                            "[decode e2e health] Available components in discovery: {:?}",
+                            components
+                        );
+                    } else {
+                        tracing::info!(
+                            "[decode e2e health] Auto-discovered {} prefill workers: {:?}",
+                            prefill_ids.len(),
+                            prefill_ids
+                        );
+                    }
+                    prefill_ids
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[decode e2e health] Failed to query discovery service: {}. Will send single request without prefill targeting.",
+                        e
+                    );
+                    vec![]
+                }
+            }
+        }
+    };
+
+    let chat_url = format!("{}/v1/chat/completions", frontend_url.trim_end_matches('/'));
+    let start_time = Instant::now();
+
+    // If we have specific prefill instance IDs, try each one
+    if !prefill_instance_ids.is_empty() {
+        tracing::info!(
+            "[decode e2e health] Starting prefill worker fallback: will try {} workers sequentially until one succeeds",
+            prefill_instance_ids.len()
+        );
+
+        let mut last_error = String::new();
+        let mut tried_count = 0;
+
+        for prefill_id in &prefill_instance_ids {
+            tried_count += 1;
+
+            let health_request = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 1,
+                "stream": false,
+                "temperature": 0.0,
+                "nvext": {
+                    "backend_instance_id": prefill_id,
+                    "decode_instance_id": decode_instance_id
+                }
+            });
+
+            tracing::info!(
+                "[decode e2e health] Attempt {}/{}: Trying prefill worker {} | URL: {} | backend_instance_id: {} | decode_instance_id: {}",
+                tried_count,
+                prefill_instance_ids.len(),
+                prefill_id,
+                chat_url,
+                prefill_id,
+                decode_instance_id
+            );
+
+            let result = e2e_state
+                .http_client
+                .post(&chat_url)
+                .header("Content-Type", "application/json")
+                .header("X-Health-Check", "true")
+                .json(&health_request)
+                .send()
+                .await;
+
+            match result {
+                Ok(response) if response.status().is_success() => {
+                    let elapsed = start_time.elapsed();
+                    *e2e_state.last_healthy.write().await = Some(Instant::now());
+
+                    tracing::info!(
+                        "[decode e2e health] PASSED via prefill worker {} in {:?} (decode_instance_id={}, attempts={}/{})",
+                        prefill_id,
+                        elapsed,
+                        decode_instance_id,
+                        tried_count,
+                        prefill_instance_ids.len()
+                    );
+
+                    return (
+                        StatusCode::OK,
+                        json!({
+                            "status": "healthy",
+                            "worker_type": "decode",
+                            "decode_instance_id": decode_instance_id,
+                            "e2e_check": "passed",
+                            "prefill_worker_used": prefill_id,
+                            "prefill_workers_tried": tried_count,
+                            "prefill_workers_total": prefill_instance_ids.len(),
+                            "latency_ms": elapsed.as_millis()
+                        })
+                        .to_string(),
+                    )
+                        .into_response();
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    let error_body = response.text().await.unwrap_or_default();
+                    last_error = format!("HTTP {} - {}", status, error_body);
+                    tracing::warn!(
+                        "[decode e2e health] Attempt {}/{}: Prefill worker {} FAILED: {}",
+                        tried_count,
+                        prefill_instance_ids.len(),
+                        prefill_id,
+                        last_error
+                    );
+                }
+                Err(e) => {
+                    last_error = if e.is_timeout() {
+                        "Request timed out".to_string()
+                    } else if e.is_connect() {
+                        format!("Connection failed: {}", e)
+                    } else {
+                        e.to_string()
+                    };
+                    tracing::warn!(
+                        "[decode e2e health] Attempt {}/{}: Prefill worker {} FAILED: {}",
+                        tried_count,
+                        prefill_instance_ids.len(),
+                        prefill_id,
+                        last_error
+                    );
+                }
+            }
+        }
+
+        // All prefill workers failed
+        let elapsed = start_time.elapsed();
+        tracing::error!(
+            "[decode e2e health] FAILED: All {} prefill workers failed (decode_instance_id={}, total_time={:?}). Last error: {}",
+            prefill_instance_ids.len(),
+            decode_instance_id,
+            elapsed,
+            last_error
+        );
+
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "status": "unhealthy",
+                "worker_type": "decode",
+                "decode_instance_id": decode_instance_id,
+                "e2e_check": "failed",
+                "error": format!("All {} prefill workers failed", prefill_instance_ids.len()),
+                "last_error": last_error,
+                "prefill_workers_tried": tried_count,
+                "prefill_instance_ids": prefill_instance_ids,
+                "latency_ms": elapsed.as_millis()
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+
+    // No specific prefill IDs configured - send single request without prefill targeting
+    // but still pin the decode worker via decode_instance_id
+    let health_request = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_completion_tokens": 1,
+        "stream": false,
+        "temperature": 0.0,
+        "nvext": {
+            "decode_instance_id": decode_instance_id
+        }
+    });
+
+    tracing::info!(
+        "[decode e2e health] Sending single request (no prefill targeting, decode_instance_id={}) to {} | Request payload: {}",
+        decode_instance_id,
+        chat_url,
+        serde_json::to_string(&health_request).unwrap_or_else(|_| "failed to serialize".to_string())
+    );
+
+    let result = e2e_state
+        .http_client
+        .post(&chat_url)
+        .header("Content-Type", "application/json")
+        .header("X-Health-Check", "true")
+        .json(&health_request)
+        .send()
+        .await;
+
+    let elapsed = start_time.elapsed();
+
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            tracing::info!(
+                "[decode e2e health] Received response: HTTP {} in {:?}",
+                status,
+                elapsed
+            );
+
+            if status.is_success() {
+                *e2e_state.last_healthy.write().await = Some(Instant::now());
+
+                tracing::info!(
+                    "[decode e2e health] PASSED in {:?} (decode_instance_id={}, no prefill targeting)",
+                    elapsed,
+                    decode_instance_id
+                );
+
+                (
+                    StatusCode::OK,
+                    json!({
+                        "status": "healthy",
+                        "worker_type": "decode",
+                        "decode_instance_id": decode_instance_id,
+                        "e2e_check": "passed",
+                        "prefill_targeting": "none",
+                        "latency_ms": elapsed.as_millis()
+                    })
+                    .to_string(),
+                )
+                    .into_response()
+            } else {
+                let error_body = response.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "[decode e2e health] FAILED: HTTP {} - {} (decode_instance_id={})",
+                    status,
+                    error_body,
+                    decode_instance_id
+                );
+
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({
+                        "status": "unhealthy",
+                        "worker_type": "decode",
+                        "decode_instance_id": decode_instance_id,
+                        "e2e_check": "failed",
+                        "error": format!("HTTP {}: {}", status, error_body),
+                        "latency_ms": elapsed.as_millis()
+                    })
+                    .to_string(),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => {
+            let error_msg = if e.is_timeout() {
+                "Request timed out".to_string()
+            } else if e.is_connect() {
+                format!("Failed to connect to frontend: {}", e)
+            } else {
+                e.to_string()
+            };
+
+            tracing::warn!(
+                "[decode e2e health] FAILED: {} (decode_instance_id={})",
+                error_msg,
+                decode_instance_id
+            );
+
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "status": "unhealthy",
+                    "worker_type": "decode",
+                    "decode_instance_id": decode_instance_id,
+                    "e2e_check": "failed",
+                    "error": error_msg,
+                    "latency_ms": elapsed.as_millis()
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// E2E health check logic for prefill workers
+/// Routes the health check request to THIS specific prefill worker using backend_instance_id
+async fn worker_e2e_health_check(
+    _state: Arc<SystemStatusState>,
+    e2e_state: Arc<WorkerE2EHealthState>,
+    worker_type: &str,
+) -> impl IntoResponse {
+    let last_healthy_timeout = get_e2e_last_healthy_timeout();
+
+    tracing::info!(
+        "[{} e2e health] Starting health check (last_healthy_timeout: {:?})",
+        worker_type,
+        last_healthy_timeout
+    );
+
+    // Acquire lock to prevent concurrent health checks
+    let _guard = e2e_state.health_lock.lock().await;
+    tracing::info!("[{} e2e health] Acquired health check lock", worker_type);
+
+    // Check if recent health check is still valid (cached)
+    {
+        let last_healthy = e2e_state.last_healthy.read().await;
+        if let Some(last) = *last_healthy {
+            let age = last.elapsed();
+            tracing::info!(
+                "[{} e2e health] Last healthy check was {:?} ago (timeout: {:?})",
+                worker_type,
+                age,
+                last_healthy_timeout
+            );
+            if age < last_healthy_timeout {
+                tracing::info!(
+                    "[{} e2e health] Returning cached healthy response (age: {:?})",
+                    worker_type,
+                    age
+                );
+                return (
+                    StatusCode::OK,
+                    json!({
+                        "status": "healthy",
+                        "worker_type": worker_type,
+                        "cached": true,
+                        "last_check_age_secs": age.as_secs_f64()
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+            }
+        } else {
+            tracing::info!(
+                "[{} e2e health] No previous healthy check recorded",
+                worker_type
+            );
+        }
+    }
+
+    // Check if a recent user request completed successfully (active traffic = healthy)
+    {
+        let last_req_age = _state.drt().system_health().lock().last_successful_request_age();
+        if let Some(age) = last_req_age {
+            if age < last_healthy_timeout {
+                tracing::info!(
+                    "[{} e2e health] Active traffic detected: last successful request was {:?} ago, returning healthy",
+                    worker_type,
+                    age
+                );
+                return (
+                    StatusCode::OK,
+                    json!({
+                        "status": "healthy",
+                        "worker_type": worker_type,
+                        "cached": true,
+                        "source": "active_traffic",
+                        "last_request_age_secs": age.as_secs_f64()
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Get frontend URL from environment
+    let frontend_url = match std::env::var(FRONTEND_URL_ENV) {
+        Ok(url) => {
+            tracing::info!("[{} e2e health] Frontend URL: {}", worker_type, url);
+            url
+        }
+        Err(_) => {
+            tracing::warn!(
+                "[{} e2e health] Skipped: {} not set. Set this to enable e2e health checks.",
+                worker_type,
+                FRONTEND_URL_ENV
+            );
+            return (
+                StatusCode::OK,
+                json!({
+                    "status": "healthy",
+                    "worker_type": worker_type,
+                    "e2e_check": "skipped",
+                    "reason": format!("{} not configured", FRONTEND_URL_ENV)
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    // Get model name from environment
+    let model = match std::env::var(HEALTH_CHECK_MODEL_ENV) {
+        Ok(m) => {
+            tracing::info!("[{} e2e health] Model: {}", worker_type, m);
+            m
+        }
+        Err(_) => {
+            tracing::warn!(
+                "[{} e2e health] Skipped: {} not set",
+                worker_type,
+                HEALTH_CHECK_MODEL_ENV
+            );
+            return (
+                StatusCode::OK,
+                json!({
+                    "status": "healthy",
+                    "worker_type": worker_type,
+                    "e2e_check": "skipped",
+                    "reason": format!("{} not configured", HEALTH_CHECK_MODEL_ENV)
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    // Get this worker's instance_id for routing (prefill workers only)
+    let instance_id = _state.drt().connection_id();
+    tracing::info!(
+        "[{} e2e health] This worker's instance_id (connection_id): {}",
+        worker_type,
+        instance_id
+    );
+
+    // Create minimal chat completion request
+    // For prefill workers, include backend_instance_id to route to THIS specific worker
+    let health_request = if worker_type == "prefill" {
+        tracing::info!(
+            "[prefill e2e health] Creating request with backend_instance_id={} to route to THIS worker",
+            instance_id
+        );
+        json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 1,
+            "stream": false,
+            "temperature": 0.0,
+            "nvext": {
+                "backend_instance_id": instance_id
+            }
+        })
+    } else {
+        // For decode workers, don't specify backend_instance_id initially
+        // (we'll handle this differently below)
+        tracing::info!(
+            "[decode e2e health] Creating request without backend_instance_id (will use load balancer)"
+        );
+        json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 1,
+            "stream": false,
+            "temperature": 0.0
+        })
+    };
+
+    let chat_url = format!("{}/v1/chat/completions", frontend_url.trim_end_matches('/'));
+    let start_time = Instant::now();
+
+    tracing::info!(
+        "[{} e2e health] Sending request to {} | Request payload: {}",
+        worker_type,
+        chat_url,
+        serde_json::to_string(&health_request).unwrap_or_else(|_| "failed to serialize".to_string())
+    );
+
+    // Send request to frontend
+    let result = e2e_state
+        .http_client
+        .post(&chat_url)
+        .header("Content-Type", "application/json")
+        .header("X-Health-Check", "true")
+        .json(&health_request)
+        .send()
+        .await;
+
+    let elapsed = start_time.elapsed();
+
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            tracing::info!(
+                "[{} e2e health] Received response: HTTP {} in {:?}",
+                worker_type,
+                status,
+                elapsed
+            );
+
+            if status.is_success() {
+                // Update last healthy timestamp
+                *e2e_state.last_healthy.write().await = Some(Instant::now());
+
+                tracing::info!(
+                    "[{} e2e health] PASSED in {:?} (instance_id={})",
+                    worker_type,
+                    elapsed,
+                    instance_id
+                );
+
+                (
+                    StatusCode::OK,
+                    json!({
+                        "status": "healthy",
+                        "worker_type": worker_type,
+                        "instance_id": instance_id,
+                        "e2e_check": "passed",
+                        "latency_ms": elapsed.as_millis()
+                    })
+                    .to_string(),
+                )
+                    .into_response()
+            } else {
+                let error_body = response.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "[{} e2e health] FAILED: HTTP {} - {} (instance_id={})",
+                    worker_type,
+                    status,
+                    error_body,
+                    instance_id
+                );
+
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({
+                        "status": "unhealthy",
+                        "worker_type": worker_type,
+                        "instance_id": instance_id,
+                        "e2e_check": "failed",
+                        "error": format!("HTTP {}: {}", status, error_body),
+                        "latency_ms": elapsed.as_millis()
+                    })
+                    .to_string(),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => {
+            let error_msg = if e.is_timeout() {
+                "Request timed out".to_string()
+            } else if e.is_connect() {
+                format!("Failed to connect to frontend: {}", e)
+            } else {
+                e.to_string()
+            };
+
+            tracing::warn!(
+                "[{} e2e health] FAILED: {} (instance_id={})",
+                worker_type,
+                error_msg,
+                instance_id
+            );
+
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "status": "unhealthy",
+                    "worker_type": worker_type,
+                    "instance_id": instance_id,
+                    "e2e_check": "failed",
+                    "error": error_msg,
+                    "latency_ms": elapsed.as_millis()
                 })
                 .to_string(),
             )

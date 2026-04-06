@@ -203,14 +203,15 @@ impl KvPushRouter {
         let allowed_worker_ids = routing.and_then(|r| r.allowed_worker_ids.clone());
         let (routing_token_ids, block_mm_infos) = request.block_mm_routing_info();
 
-        // Get pre-selected worker based on phase, with backend_instance_id as fallback
+        // Get pre-selected worker based on phase, with explicit decode targeting
+        // and backend_instance_id as fallback.
         let preselected_id = match phase {
             RequestPhase::Prefill => {
                 routing.and_then(|r| r.prefill_worker_id.or(r.backend_instance_id))
             }
-            RequestPhase::Decode => {
-                routing.and_then(|r| r.decode_worker_id.or(r.backend_instance_id))
-            }
+            RequestPhase::Decode => request
+                .decode_instance_id
+                .or_else(|| routing.and_then(|r| r.decode_worker_id.or(r.backend_instance_id))),
             RequestPhase::Aggregated => routing.and_then(|r| r.backend_instance_id),
         };
 
@@ -512,12 +513,14 @@ impl DirectRoutingRouter {
     /// Returns an error if no worker ID is found (required in direct routing mode).
     fn get_worker_id(request: &PreprocessedRequest) -> Result<u64, Error> {
         let routing = request.routing.as_ref();
-        let worker_id = routing.and_then(|r| r.decode_worker_id.or(r.backend_instance_id));
+        let worker_id = request
+            .decode_instance_id
+            .or_else(|| routing.and_then(|r| r.decode_worker_id.or(r.backend_instance_id)));
 
         worker_id.ok_or_else(|| {
             anyhow::anyhow!(
                 "Worker ID required (--direct-route) but none found in request. \
-                 Expected decode_worker_id or backend_instance_id to be set by external router (e.g., EPP)."
+                 Expected decode_instance_id, decode_worker_id, or backend_instance_id to be set by external router (e.g., EPP)."
             )
         })
     }

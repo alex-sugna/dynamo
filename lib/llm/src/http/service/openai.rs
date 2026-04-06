@@ -1096,6 +1096,7 @@ async fn chat_completions(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
+        state.record_successful_request();
         Ok(sse_stream.into_response())
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
@@ -1141,6 +1142,7 @@ async fn chat_completions(
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
+        state.record_successful_request();
         Ok(Json(response).into_response())
     }
 }

@@ -136,6 +136,16 @@ where
         Ok(())
     }
 
+    fn set_last_successful_request(
+        &self,
+        handle: Arc<std::sync::RwLock<Option<std::time::Instant>>>,
+    ) -> Result<()> {
+        self.last_successful_request
+            .set(handle)
+            .map_err(|_| anyhow::anyhow!("last_successful_request handle already set"))?;
+        Ok(())
+    }
+
     async fn handle_payload(&self, payload: Bytes) -> Result<(), PipelineError> {
         let start_time = std::time::Instant::now();
 
@@ -327,6 +337,10 @@ where
             // This resets the timer, delaying the next canary health check.
             if let Some(notifier) = self.endpoint_health_check_notifier.get() {
                 notifier.notify_one();
+            }
+            // Record successful request for e2e health check caching
+            if let Some(handle) = self.last_successful_request.get() {
+                *handle.write().unwrap() = Some(std::time::Instant::now());
             }
         }
 

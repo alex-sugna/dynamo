@@ -165,6 +165,11 @@ pub struct PreprocessedRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingHints>,
 
+    /// Targeted decode instance ID for disaggregated routing
+    /// If set, the decode phase will route to this specific decode worker.
+    #[builder(default)]
+    pub decode_instance_id: Option<u64>,
+
     /// Router configuration overrides for this specific request
     #[builder(default)]
     pub router_config_override: Option<RouterConfigOverride>,

@@ -18,7 +18,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
@@ -55,6 +55,10 @@ pub struct SystemHealth {
     live_path: String,
     start_time: Instant,
     uptime_gauge: OnceLock<prometheus::Gauge>,
+    /// Timestamp of the last successful user request completion on this worker.
+    /// Shared with request handlers via Arc so they can update it without
+    /// going through the parking_lot::Mutex that wraps SystemHealth.
+    last_successful_request: Arc<std::sync::RwLock<Option<Instant>>>,
 }
 
 impl SystemHealth {
@@ -84,6 +88,7 @@ impl SystemHealth {
             live_path,
             start_time: Instant::now(),
             uptime_gauge: OnceLock::new(),
+            last_successful_request: Arc::new(std::sync::RwLock::new(None)),
         }
     }
     pub fn set_health_status(&mut self, status: HealthStatus) {
@@ -274,5 +279,26 @@ impl SystemHealth {
     /// Get the liveness check path
     pub fn live_path(&self) -> &str {
         &self.live_path
+    }
+
+    /// Record a successful user request completion.
+    /// Called by request handlers after a request finishes successfully.
+    pub fn record_successful_request(&self) {
+        *self.last_successful_request.write().unwrap() = Some(Instant::now());
+    }
+
+    /// Get the elapsed time since the last successful user request, if any.
+    pub fn last_successful_request_age(&self) -> Option<Duration> {
+        self.last_successful_request
+            .read()
+            .unwrap()
+            .map(|t| t.elapsed())
+    }
+
+    /// Get a clone of the shared last_successful_request handle.
+    /// Passed to request handlers so they can update it directly
+    /// without going through the SystemHealth mutex.
+    pub fn last_successful_request_handle(&self) -> Arc<std::sync::RwLock<Option<Instant>>> {
+        self.last_successful_request.clone()
     }
 }

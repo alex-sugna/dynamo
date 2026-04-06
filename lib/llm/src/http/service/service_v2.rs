@@ -39,6 +39,9 @@ pub struct State {
     discovery_client: Arc<dyn Discovery>,
     flags: StateFlags,
     cancel_token: CancellationToken,
+    /// Timestamp of the last successful user request (e.g., chat completion).
+    /// Used by the frontend e2e health check to skip probes when traffic is active.
+    last_successful_request: std::sync::RwLock<Option<std::time::Instant>>,
 }
 
 #[derive(Default, Debug)]
@@ -118,6 +121,7 @@ impl State {
                 anthropic_endpoints_enabled: AtomicBool::new(false),
             },
             cancel_token,
+            last_successful_request: std::sync::RwLock::new(None),
         }
     }
 
@@ -151,6 +155,19 @@ impl State {
     // TODO
     pub fn sse_keep_alive(&self) -> Option<Duration> {
         None
+    }
+
+    /// Record a successful user request completion (e.g., chat completion returned 200).
+    pub fn record_successful_request(&self) {
+        *self.last_successful_request.write().unwrap() = Some(std::time::Instant::now());
+    }
+
+    /// Get the elapsed time since the last successful user request, if any.
+    pub fn last_successful_request_age(&self) -> Option<std::time::Duration> {
+        self.last_successful_request
+            .read()
+            .unwrap()
+            .map(|t| t.elapsed())
     }
 }
 
@@ -437,6 +454,9 @@ impl HttpServiceConfigBuilder {
 
         let mut all_docs = Vec::new();
 
+        // Create frontend health state for e2e health checks
+        let frontend_health_state = Arc::new(super::health::FrontendHealthState::new());
+
         let mut routes = vec![
             metrics::router(
                 registry,
@@ -447,6 +467,7 @@ impl HttpServiceConfigBuilder {
             super::health::health_check_router(state.clone(), var(HTTP_SVC_HEALTH_PATH_ENV).ok()),
             super::health::live_check_router(state.clone(), var(HTTP_SVC_LIVE_PATH_ENV).ok()),
             super::busy_threshold::busy_threshold_router(state.clone(), None),
+            super::health::frontend_health_check_router(state.clone(), frontend_health_state),
         ];
 
         let endpoint_routes =

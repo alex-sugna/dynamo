@@ -113,6 +113,12 @@ impl EndpointConfigBuilder {
         // Get the unified request plane server
         let server = endpoint.drt().request_plane_server().await?;
 
+        // Always wire up active-traffic tracking so e2e health checks
+        // can detect recent successful requests regardless of canary config.
+        handler.set_last_successful_request(
+            system_health.lock().last_successful_request_handle(),
+        )?;
+
         // Register health check target in SystemHealth if provided
         if let Some(health_check_payload) = &health_check_payload {
             // Build transport based on request plane mode

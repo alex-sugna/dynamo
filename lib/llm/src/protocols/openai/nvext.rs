@@ -131,6 +131,13 @@ pub struct NvExt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_data: Option<Vec<u32>>,
 
+    /// Targeted decode instance ID for the request
+    /// If set, the request will be routed to the decode instance with the given ID.
+    /// Only meaningful in disaggregated deployments.
+    #[builder(default, setter(strip_option))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_instance_id: Option<u64>,
+
     /// Maximum number of thinking tokens allowed
     /// NOTE: Currently passed through to backends as a no-op for future implementation
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +243,7 @@ mod tests {
         assert_eq!(nv_ext.use_raw_prompt, None);
         assert_eq!(nv_ext.annotations, None);
         assert_eq!(nv_ext.backend_instance_id, None);
+        assert_eq!(nv_ext.decode_instance_id, None);
         assert_eq!(nv_ext.token_data, None);
         assert_eq!(nv_ext.max_thinking_tokens, None);
         assert_eq!(nv_ext.extra_fields, None);
@@ -251,6 +259,7 @@ mod tests {
             .greed_sampling(true)
             .use_raw_prompt(true)
             .backend_instance_id(42)
+            .decode_instance_id(99)
             .token_data(vec![1, 2, 3, 4])
             .max_thinking_tokens(1024)
             .extra_fields(vec!["worker_id".to_string()])
@@ -260,6 +269,7 @@ mod tests {
         assert_eq!(nv_ext.greed_sampling, Some(true));
         assert_eq!(nv_ext.use_raw_prompt, Some(true));
         assert_eq!(nv_ext.backend_instance_id, Some(42));
+        assert_eq!(nv_ext.decode_instance_id, Some(99));
         assert_eq!(nv_ext.token_data, Some(vec![1, 2, 3, 4]));
         assert_eq!(nv_ext.max_thinking_tokens, Some(1024));
         assert_eq!(nv_ext.extra_fields, Some(vec!["worker_id".to_string()]));

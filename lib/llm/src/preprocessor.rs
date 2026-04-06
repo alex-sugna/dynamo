@@ -295,6 +295,7 @@ impl OpenAIPreprocessor {
                 allowed_worker_ids: None,
             };
             builder.routing(Some(routing));
+            builder.decode_instance_id(nvext.decode_instance_id);
         } else if lora_name.is_some() {
             // Ensure LoRA-aware routing still gets hints even when nvext is absent.
             builder.routing(Some(RoutingHints {

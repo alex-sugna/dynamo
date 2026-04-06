@@ -600,6 +600,12 @@ impl
         // Prepare prefill request with max_tokens = 1 (clone after tracker is set)
         let mut prefill_req = req.clone();
         prefill_req.stop_conditions.max_tokens = Some(1);
+        // Clear decode_instance_id so it doesn't leak into prefill routing.
+        // decode_instance_id targets decode workers, but the prefill router's
+        // PushRouter is connected to the prefill component (prefill/generate).
+        // If this ID leaks through, the prefill KvPushRouter will try to find
+        // the decode worker in the prefill endpoint and fail.
+        prefill_req.decode_instance_id = None;
 
         // Try to resolve prefill worker upfront: if we can get bootstrap info early,
         // spawn prefill in background and proceed to decode immediately.
@@ -705,6 +711,18 @@ impl
 
                 // Restore original max_tokens for decode
                 decode_req.stop_conditions.max_tokens = original_max_tokens;
+                // Note: decode_instance_id is already set on req from preprocessing,
+                // so it propagates naturally to decode_req via the clone above.
+
+                // Clear backend_instance_id so it doesn't propagate to the decode router.
+                // backend_instance_id targets prefill workers (registered under prefill/generate),
+                // but the decode router's PushRouter is connected to the decode component
+                // (e.g., tensorrt_llm/generate). If this ID leaks through, the decode
+                // KvPushRouter will try to find the prefill worker in the decode endpoint
+                // and fail with "instance_id not found".
+                if let Some(ref mut r) = decode_req.routing {
+                    r.backend_instance_id = None;
+                }
 
                 // Set router_config_override for decode:
                 // - overlap_score_weight = 0 (no KV cache overlap scoring for decode)
@@ -729,7 +747,13 @@ impl
                     return Err(anyhow::anyhow!(PrefillError::NotActivated));
                 }
                 tracing::debug!("No prefill workers discovered yet, falling back to decode-only");
-                next.generate(context.map(|_| req)).await
+                // Clear backend_instance_id to prevent the decode router from trying
+                // to find a prefill worker ID in its endpoint (see success path comment).
+                let mut fallback_req = req;
+                if let Some(ref mut r) = fallback_req.routing {
+                    r.backend_instance_id = None;
+                }
+                next.generate(context.map(|_| fallback_req)).await
             }
             Err(e) => {
                 if !self.decode_fallback {
@@ -743,7 +767,13 @@ impl
                     error = %e,
                     "Remote prefill failed, falling back to decode-only. This may impact performance in disaggregated deployments. Verify prefill workers are healthy and accessible."
                 );
-                next.generate(context.map(|_| req)).await
+                // Clear backend_instance_id to prevent the decode router from trying
+                // to find a prefill worker ID in its endpoint (see success path comment).
+                let mut fallback_req = req;
+                if let Some(ref mut r) = fallback_req.routing {
+                    r.backend_instance_id = None;
+                }
+                next.generate(context.map(|_| fallback_req)).await
             }
         }
     }

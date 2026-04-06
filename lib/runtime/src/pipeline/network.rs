@@ -281,6 +281,8 @@ pub struct Ingress<Req: PipelineIO, Resp: PipelineIO> {
     metrics: OnceLock<Arc<WorkHandlerMetrics>>,
     /// Endpoint-specific notifier for health check timer resets
     endpoint_health_check_notifier: OnceLock<Arc<tokio::sync::Notify>>,
+    /// Shared timestamp updated on successful request completion
+    last_successful_request: OnceLock<Arc<std::sync::RwLock<Option<std::time::Instant>>>>,
 }
 
 impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
@@ -289,6 +291,7 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
             segment: OnceLock::new(),
             metrics: OnceLock::new(),
             endpoint_health_check_notifier: OnceLock::new(),
+            last_successful_request: OnceLock::new(),
         })
     }
 
@@ -357,6 +360,15 @@ pub trait PushWorkHandler: Send + Sync {
     fn set_endpoint_health_check_notifier(
         &self,
         _notifier: Arc<tokio::sync::Notify>,
+    ) -> Result<()> {
+        // Default implementation for backwards compatibility
+        Ok(())
+    }
+
+    /// Set the shared last_successful_request timestamp handle
+    fn set_last_successful_request(
+        &self,
+        _handle: Arc<std::sync::RwLock<Option<std::time::Instant>>>,
     ) -> Result<()> {
         // Default implementation for backwards compatibility
         Ok(())
