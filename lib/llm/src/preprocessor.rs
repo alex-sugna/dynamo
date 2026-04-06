@@ -15,6 +15,7 @@ pub mod media;
 pub mod prompt;
 pub mod speculative_prefill;
 pub mod tools;
+mod tokenizer_cache;
 use anyhow::Context;
 use anyhow::{Result, bail};
 
@@ -26,13 +27,14 @@ use dynamo_runtime::error::{DynamoError, ErrorType};
 use futures::Stream;
 use futures::stream::{self, StreamExt};
 use prompt::OAIPromptFormatter;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 use tracing;
 
 use crate::model_card::{ModelDeploymentCard, ModelInfo};
 use crate::preprocessor::media::MediaLoader;
 use crate::preprocessor::prompt::OAIChatLikeRequest;
+use crate::preprocessor::tokenizer_cache::TokenizerCache;
 use crate::protocols::common::preprocessor::{
     MultimodalData, MultimodalDataMap, PreprocessedRequestBuilder, RoutingHints,
 };
@@ -142,6 +144,7 @@ pub struct OpenAIPreprocessor {
     mdcsum: String,
     formatter: Arc<dyn OAIPromptFormatter>,
     tokenizer: Arc<dyn Tokenizer>,
+    tokenizer_cache: Option<TokenizerCache>,
     model_info: Arc<dyn ModelInfo>,
     lora_name: Option<String>,
     /// Per-model runtime configuration propagated to response generator (e.g., reasoning/tool parser)
@@ -168,6 +171,13 @@ impl OpenAIPreprocessor {
     ) -> Result<Arc<Self>> {
         let mdcsum = mdc.mdcsum().to_string();
         let tokenizer: Arc<dyn Tokenizer> = (*tokenizer).clone();
+        let tokenizer_cache = TokenizerCache::from_model_card(&mdc).inspect_err(|error| {
+            tracing::warn!(
+                model = %mdc.display_name,
+                %error,
+                "Failed to initialize tokenizer cache; continuing without it"
+            );
+        }).ok().flatten();
         let lora_name = mdc.lora.as_ref().map(|l| l.name.clone());
         let Some(ref model_info) = mdc.model_info else {
             anyhow::bail!(
@@ -194,6 +204,7 @@ impl OpenAIPreprocessor {
         Ok(Arc::new(Self {
             formatter,
             tokenizer,
+            tokenizer_cache,
             model_info,
             mdcsum,
             lora_name,
@@ -205,7 +216,7 @@ impl OpenAIPreprocessor {
     }
     /// Encode a string to it's tokens
     pub fn tokenize(&self, s: &str) -> anyhow::Result<Encoding> {
-        self.tokenizer.encode(s)
+        self.encode_text(s)
     }
 
     /// Translate a [`NvCreateChatCompletionRequest`] request to a common completion request.
@@ -579,11 +590,19 @@ impl OpenAIPreprocessor {
         tracker: Option<&RequestTracker>,
     ) -> anyhow::Result<Encoding> {
         let encode_start = Instant::now();
-        let encoding = self.tokenizer.encode(prompt)?;
+        let encoding = self.encode_text(prompt)?;
         if let Some(t) = tracker {
             t.record_tokenize_latency(encode_start.elapsed());
         }
         Ok(encoding)
+    }
+
+    fn encode_text(&self, prompt: &str) -> anyhow::Result<Encoding> {
+        if let Some(cache) = &self.tokenizer_cache {
+            cache.encode(prompt)
+        } else {
+            self.tokenizer.encode(prompt)
+        }
     }
 
     /// Preprocess an embedding request, handling both text and token ID inputs.
@@ -1189,6 +1208,12 @@ impl
         // unpack the request
         let (mut request, context) = request.into_parts();
 
+        // Retrieve dynamo_received_at timestamp from context registry (set in HTTP handler)
+        let dynamo_received_at: Option<f64> = context
+            .get::<f64>("dynamo_received_at")
+            .ok()
+            .map(|v| *v);
+
         // Preserve original inbound streaming flag before any internal overrides
         let request_id = context.id().to_string();
         let original_stream_flag = request.inner.stream.unwrap_or(false);
@@ -1212,11 +1237,63 @@ impl
         let response_generator = request.response_generator(context.id().to_string());
         let tracker = response_generator.tracker();
 
+        // Capture preprocessing start timestamp (float seconds)
+        let preprocessing_start_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
         // convert the chat completion request to a common completion request
         let (mut common_request, annotations) = self
             .preprocess_request(&request, tracker.as_deref())
             .await?;
+
+        // Capture preprocessing end timestamp (float seconds)
+        let preprocessing_end_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
         tracing::trace!(request = ?common_request, "Pre-processed request");
+
+        // Build extra_args with request_id, rid, and timestamps
+        let mut extra_args = common_request
+            .extra_args
+            .take()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+
+        // Add request_id and rid if present
+        if let Some(ref req_id) = request.request_id {
+            extra_args.insert("request_id".to_string(), serde_json::Value::String(req_id.clone()));
+        }
+        if let Some(ref rid) = request.rid {
+            extra_args.insert("rid".to_string(), serde_json::Value::String(rid.clone()));
+        }
+
+        // Add timestamps (as floats)
+        if let Some(ts) = dynamo_received_at {
+            if let Some(num) = serde_json::Number::from_f64(ts) {
+                extra_args.insert(
+                    "dynamo_received_at".to_string(),
+                    serde_json::Value::Number(num),
+                );
+            }
+        }
+        if let Some(num) = serde_json::Number::from_f64(preprocessing_start_at) {
+            extra_args.insert(
+                "preprocessing_start_at".to_string(),
+                serde_json::Value::Number(num),
+            );
+        }
+        if let Some(num) = serde_json::Number::from_f64(preprocessing_end_at) {
+            extra_args.insert(
+                "preprocessing_end_at".to_string(),
+                serde_json::Value::Number(num),
+            );
+        }
+
+        common_request.extra_args = Some(serde_json::Value::Object(extra_args));
 
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;

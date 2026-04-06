@@ -18,6 +18,7 @@ import dataclasses
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from typing import Any, AsyncGenerator, Optional, Union
@@ -268,7 +269,7 @@ class HandlerBase(BaseGenerativeHandler):
 
     def _decode_disaggregated_params_from_prefill(
         self, prefill_result: dict
-    ) -> tuple[Any, dict]:
+    ) -> tuple[Any, dict, Optional[float]]:
         """
         Extract and decode disaggregated params from prefill_result.
 
@@ -276,14 +277,19 @@ class HandlerBase(BaseGenerativeHandler):
             prefill_result: Result from prefill worker containing encoded disaggregated params
 
         Returns:
-            Tuple of (disaggregated_params, epd_metadata) where:
+            Tuple of (disaggregated_params, epd_metadata, trtllm_returns_disagg_params_at) where:
             - disaggregated_params: Decoded LlmDisaggregatedParams object
             - epd_metadata: Dictionary containing EPD-specific metadata (_epd_processed_prompt, etc.)
+            - trtllm_returns_disagg_params_at: Timestamp from prefill worker (float seconds)
         """
         params_dict = prefill_result["disaggregated_params"]
 
         # Remove worker_id if present (added by prefill worker, not needed for decode)
         params_dict.pop("worker_id", None)
+        # Pop timestamps that were passed from prefill (we don't use them in decode, just remove them)
+        params_dict.pop("request_handler_received_at", None)
+        params_dict.pop("engine_submit_at", None)
+        trtllm_returns_disagg_params_at = params_dict.pop("trtllm_returns_disagg_params_at", None)
 
         # Deserialize first_gen_log_probs from transport format back to
         # TRT-LLM's internal {token_id: Logprob} dict format.
@@ -316,7 +322,7 @@ class HandlerBase(BaseGenerativeHandler):
 
         logging.debug("DECODE: Set request_type to generation_only")
 
-        return disaggregated_params, epd_metadata
+        return disaggregated_params, epd_metadata, trtllm_returns_disagg_params_at
 
     def _encode_and_pack_disaggregated_params(
         self,
@@ -419,7 +425,7 @@ class HandlerBase(BaseGenerativeHandler):
         self,
         request: dict,
         ep_disaggregated_params: Optional[Any],
-    ) -> tuple[Any, Any, dict]:
+    ) -> tuple[Any, Any, dict, Optional[float]]:
         """
         Setup disaggregated_params based on disaggregation mode.
 
@@ -441,10 +447,12 @@ class HandlerBase(BaseGenerativeHandler):
             ep_disaggregated_params: Optional params from encode worker (EPD flow)
 
         Returns:
-            Tuple of (disaggregated_params, ep_disaggregated_params, epd_metadata)
+            Tuple of (disaggregated_params, ep_disaggregated_params, epd_metadata,
+            trtllm_returns_disagg_params_at)
         """
         disaggregated_params = None
         epd_metadata = {}
+        trtllm_returns_disagg_params_at = None
 
         # PREFILL mode: setup context_only params
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -476,11 +484,12 @@ class HandlerBase(BaseGenerativeHandler):
             (
                 disaggregated_params,
                 epd_metadata,
+                trtllm_returns_disagg_params_at,
             ) = self._decode_disaggregated_params_from_prefill(prefill_result)
             # For full EPD flow, make decoded params available to multimodal processor
             ep_disaggregated_params = disaggregated_params
 
-        return disaggregated_params, ep_disaggregated_params, epd_metadata
+        return disaggregated_params, ep_disaggregated_params, epd_metadata, trtllm_returns_disagg_params_at
 
     async def _prepare_input_for_generation(
         self,
@@ -625,6 +634,17 @@ class HandlerBase(BaseGenerativeHandler):
             embeddings: Optional tensor or dict containing embeddings for multimodal processing
             ep_disaggregated_params: Optional DisaggregatedParams from encode worker (full EPD flow)
         """
+        # Capture engine received timestamp (float seconds)
+        request_handler_received_at = time.time()
+
+        # Extract request_id from extra_args (request_id or rid) for inference routing
+        extra_args = request.get("extra_args") or {}
+        request_id = (
+            extra_args.get("request_id")
+            or extra_args.get("rid")
+            or None
+        )
+
         logging.debug(f"Request: {request}")
 
         # Normalize OpenAI format to TRT-LLM internal format
@@ -635,6 +655,7 @@ class HandlerBase(BaseGenerativeHandler):
             disaggregated_params,
             ep_disaggregated_params,
             epd_metadata,
+            trtllm_returns_disagg_params_at,
         ) = self._setup_disaggregated_params_for_mode(request, ep_disaggregated_params)
 
         # Prepare input for generation (handles multimodal/text flows)
@@ -712,7 +733,10 @@ class HandlerBase(BaseGenerativeHandler):
             False if self.disaggregation_mode == DisaggregationMode.PREFILL else True
         )
 
-        request_id = request.get("id") or request.get("request_id", "unknown-id")
+        # Extract timestamps from extra_args
+        dynamo_received_at = extra_args.get("dynamo_received_at")
+        preprocessing_start_at = extra_args.get("preprocessing_start_at")
+        preprocessing_end_at = extra_args.get("preprocessing_end_at")
 
         # Optional test-only logits processing (enable with DYNAMO_ENABLE_TEST_LOGITS_PROCESSOR=1)
         if os.getenv("DYNAMO_ENABLE_TEST_LOGITS_PROCESSOR") == "1":
@@ -741,16 +765,45 @@ class HandlerBase(BaseGenerativeHandler):
                 f"Using dynamo router dp_rank={dp_rank} for TRTLLM attention DP scheduling"
             )
 
+        # Capture engine submit timestamp (float seconds)
+        engine_submit_at = time.time()
+        logging.info(
+            f"[request timestamps] request_id={request_id} "
+            f"dynamo_received_at={dynamo_received_at} "
+            f"preprocessing_start_at={preprocessing_start_at} "
+            f"preprocessing_end_at={preprocessing_end_at} "
+            f"request_handler_received_at={request_handler_received_at} "
+            f"engine_submit_at={engine_submit_at}"
+        )
+
         try:
-            # NEW: Updated engine call to include multimodal data
-            generation_result = self.engine.llm.generate_async(
-                inputs=processed_input,  # Use the correctly extracted inputs
-                sampling_params=sampling_params,
-                disaggregated_params=disaggregated_params,
-                streaming=streaming,
-                trace_headers=trace_headers,
-                scheduling_params=scheduling_params,
-            )
+            # Pass timestamps to generate_async - only prefill needs the full set
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                generation_result = self.engine.llm.generate_async(
+                    inputs=processed_input,
+                    sampling_params=sampling_params,
+                    disaggregated_params=disaggregated_params,
+                    streaming=streaming,
+                    trace_headers=trace_headers,
+                    scheduling_params=scheduling_params,
+                    request_id=request_id,
+                    trtllm_returns_disagg_params_at=trtllm_returns_disagg_params_at,
+                )
+            else:
+                generation_result = self.engine.llm.generate_async(
+                    inputs=processed_input,
+                    sampling_params=sampling_params,
+                    disaggregated_params=disaggregated_params,
+                    streaming=streaming,
+                    trace_headers=trace_headers,
+                    scheduling_params=scheduling_params,
+                    request_id=request_id,
+                    dynamo_received_at=dynamo_received_at,
+                    preprocessing_start_at=preprocessing_start_at,
+                    preprocessing_end_at=preprocessing_end_at,
+                    request_handler_received_at=request_handler_received_at,
+                    engine_submit_at=engine_submit_at,
+                )
 
             # Monitor for cancellation triggers and cancel by calling generation_result.abort()
             async with self._cancellation_monitor(generation_result, context):
@@ -773,6 +826,10 @@ class HandlerBase(BaseGenerativeHandler):
 
                     out = {"token_ids": output.token_ids[num_output_tokens_so_far:]}
 
+                    # Add cached_tokens from the GenerationResult
+                    if res.cached_tokens is not None:
+                        out["extra_args"] = {"cached_tokens": res.cached_tokens}
+
                     # Extract logprobs from the output
                     log_probs, top_logprobs = self._extract_logprobs(
                         output, num_output_tokens_so_far
@@ -788,11 +845,44 @@ class HandlerBase(BaseGenerativeHandler):
                         out["stop_reason"] = output.stop_reason
                     if self.disaggregation_mode == DisaggregationMode.PREFILL:
                         # Return the disaggregated params only when operating in prefill mode.
+                        prefill_disagg = output.disaggregated_params
+                        trtllm_returns_disagg_params_at = time.time()
+
+                        # Validate disaggregated_params before returning
+                        if not prefill_disagg:
+                            raise ValueError(
+                                f"TRT-LLM returned None disaggregated_params. request_id={request_id}"
+                            )
+
+                        missing_fields = []
+                        if prefill_disagg.ctx_request_id is None:
+                            missing_fields.append("ctx_request_id")
+                        if prefill_disagg.first_gen_tokens is None:
+                            missing_fields.append("first_gen_tokens")
+                        if prefill_disagg.opaque_state is None:
+                            missing_fields.append("opaque_state")
+
+                        if missing_fields:
+                            logging.error(
+                                f"[prefill disagg] request_id={request_id} "
+                                f"ctx_request_id={prefill_disagg.ctx_request_id} "
+                                f"first_gen_tokens={prefill_disagg.first_gen_tokens} "
+                                f"opaque_state_len={len(prefill_disagg.opaque_state) if prefill_disagg.opaque_state else 'None'}"
+                            )
+                            raise ValueError(
+                                f"TRT-LLM returned invalid disaggregated_params: missing {', '.join(missing_fields)}. "
+                                f"request_id={request_id}"
+                            )
+
                         params_dict = self._encode_and_pack_disaggregated_params(
                             output, disaggregated_params, request, res, processed_input
                         )
                         if params_dict is not None:
                             out["disaggregated_params"] = params_dict
+                            # Pass timestamps through to decode worker
+                            out["disaggregated_params"]["request_handler_received_at"] = request_handler_received_at
+                            out["disaggregated_params"]["engine_submit_at"] = engine_submit_at
+                            out["disaggregated_params"]["trtllm_returns_disagg_params_at"] = trtllm_returns_disagg_params_at
 
                     if out.get("finish_reason"):
                         num_input_tokens = len(request.get("token_ids", []))

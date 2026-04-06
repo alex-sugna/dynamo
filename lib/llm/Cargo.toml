@@ -34,6 +34,10 @@ name = "tokenizer"
 harness = false
 
 [[bench]]
+name = "tokenizer_cache"
+harness = false
+
+[[bench]]
 name = "transfer_context_v2"
 harness = false
 required-features = ["block-manager", "testing-cuda"]
@@ -96,6 +100,7 @@ offset-allocator = "0.2"
 rayon = "1"
 dashmap = { version = "5.5.3" }
 bincode = { version = "2.0.1", features = ["serde", "derive"] }
+linked-hash-map = "0.5"
 
 # lora
 object_store = { version = "0.12.4", features = ["aws", "gcp", "azure", "http"] }
@@ -201,4 +206,3 @@ tonic-build = { version = "0.13.1" }
 name = "bench_local_transfer_v2"
 path = "bin/bench_local_transfer_v2.rs"
 required-features = ["block-manager-bench"]
-

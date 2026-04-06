@@ -67,6 +67,26 @@ pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
 const VALIDATION_PREFIX: &str = "Validation: ";
 
+fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn populate_chat_request_id(
+    request: &mut NvCreateChatCompletionRequest,
+    headers: &HeaderMap,
+    canonical_request_id: &str,
+) {
+    if request.request_id.is_none()
+        && let Some(x_request_id) = header_value(headers, "x-request-id")
+    {
+        request.request_id = Some(x_request_id.to_string());
+    }
+
+    if request.request_id.is_none() && request.rid.is_none() {
+        request.request_id = Some(canonical_request_id.to_string());
+    }
+}
+
 // Default axum max body limit without configuring is 2MB: https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html
 /// Default body limit in bytes (45MB) to support 500k+ token payloads.
 /// Can be configured at runtime using the DYN_HTTP_BODY_LIMIT_MB environment variable.
@@ -782,6 +802,12 @@ async fn handler_chat_completions(
     headers: HeaderMap,
     Json(mut request): Json<NvCreateChatCompletionRequest>,
 ) -> Result<Response, ErrorResponse> {
+    // Capture request received timestamp at the very first moment (float seconds)
+    let dynamo_received_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
@@ -789,7 +815,10 @@ async fn handler_chat_completions(
 
     // create the context for the request
     let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
-    let request = Context::with_id(request, request_id);
+    populate_chat_request_id(&mut request, &headers, &request_id);
+    let mut request = Context::with_id(request, request_id);
+    // Store timestamp in context registry for downstream access
+    request.insert("dynamo_received_at", dynamo_received_at);
     let context = request.context();
 
     // create the connection handles
@@ -2055,6 +2084,7 @@ mod tests {
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
         CreateCompletionRequest,
     };
+    use reqwest::header::HeaderValue;
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
 
@@ -2077,6 +2107,30 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+        }
+    }
+
+    fn make_base_chat_request() -> NvCreateChatCompletionRequest {
+        NvCreateChatCompletionRequest {
+            inner: CreateChatCompletionRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(
+                            "hello".to_string(),
+                        ),
+                        name: None,
+                    },
+                )],
+                ..Default::default()
+            },
+            common: Default::default(),
+            nvext: None,
+            chat_template_args: None,
+            request_id: None,
+            rid: None,
+            media_io_kwargs: None,
+            unsupported_fields: Default::default(),
         }
     }
 
@@ -2145,6 +2199,68 @@ mod tests {
     }
 
     #[test]
+    fn test_populate_chat_request_id_uses_canonical_when_request_ids_missing() {
+        let mut request = make_base_chat_request();
+        let headers = HeaderMap::new();
+
+        populate_chat_request_id(
+            &mut request,
+            &headers,
+            "347a2809-7f7f-4dc8-80b7-2975f6bbe554",
+        );
+
+        assert_eq!(
+            request.request_id.as_deref(),
+            Some("347a2809-7f7f-4dc8-80b7-2975f6bbe554")
+        );
+        assert_eq!(request.rid, None);
+    }
+
+    #[test]
+    fn test_populate_chat_request_id_prefers_x_request_id_header() {
+        let mut request = make_base_chat_request();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("client-request-id"));
+
+        populate_chat_request_id(
+            &mut request,
+            &headers,
+            "347a2809-7f7f-4dc8-80b7-2975f6bbe554",
+        );
+
+        assert_eq!(request.request_id.as_deref(), Some("client-request-id"));
+        assert_eq!(request.rid, None);
+    }
+
+    #[test]
+    fn test_populate_chat_request_id_preserves_explicit_request_id_or_rid() {
+        let mut request_with_request_id = make_base_chat_request();
+        request_with_request_id.request_id = Some("explicit-request-id".to_string());
+        let mut request_with_rid = make_base_chat_request();
+        request_with_rid.rid = Some("explicit-rid".to_string());
+        let headers = HeaderMap::new();
+
+        populate_chat_request_id(
+            &mut request_with_request_id,
+            &headers,
+            "347a2809-7f7f-4dc8-80b7-2975f6bbe554",
+        );
+        populate_chat_request_id(
+            &mut request_with_rid,
+            &headers,
+            "347a2809-7f7f-4dc8-80b7-2975f6bbe554",
+        );
+
+        assert_eq!(
+            request_with_request_id.request_id.as_deref(),
+            Some("explicit-request-id")
+        );
+        assert_eq!(request_with_request_id.rid, None);
+        assert_eq!(request_with_rid.request_id, None);
+        assert_eq!(request_with_rid.rid.as_deref(), Some("explicit-rid"));
+    }
+
+    #[test]
     fn test_validate_unsupported_fields_accepts_parallel_tool_calls() {
         let mut request = make_base_request();
         request.inner.parallel_tool_calls = Some(true);
@@ -2193,6 +2309,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         };
@@ -2225,6 +2343,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         };
@@ -2441,6 +2561,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         };
@@ -2471,6 +2593,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         };
@@ -2500,6 +2624,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         };
@@ -2529,6 +2655,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         };
@@ -2560,6 +2688,8 @@ mod tests {
                 .unwrap(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         };
@@ -2589,6 +2719,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         };

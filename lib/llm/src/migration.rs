@@ -251,6 +251,7 @@ mod tests {
             finish_reason: None,
             stop_reason: None,
             index: None,
+            extra_args: None,
             disaggregated_params: None,
             completion_usage: None,
         })

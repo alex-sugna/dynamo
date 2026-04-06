@@ -58,6 +58,14 @@ pub struct NvCreateChatCompletionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_io_kwargs: Option<MediaDecoder>,
 
+    /// Request ID for inference routing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+
+    /// Alternate request ID field for inference routing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rid: Option<String>,
+
     /// Catch-all for unsupported fields - checked during validation
     #[serde(flatten, default, skip_serializing)]
     pub unsupported_fields: std::collections::HashMap<String, serde_json::Value>,

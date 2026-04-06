@@ -255,6 +255,8 @@ impl Request {
             common: Default::default(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         }
@@ -645,6 +647,8 @@ mod context_length_validation {
             common: Default::default(),
             nvext: None,
             chat_template_args: None,
+            request_id: None,
+            rid: None,
             media_io_kwargs: None,
             unsupported_fields: Default::default(),
         }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use base64::Engine as _;
@@ -62,9 +62,7 @@ impl TikTokenTokenizer {
 
         let pattern = detect_bpe_pattern(directory)?;
         let encoder = parse_tiktoken_file(path)?;
-        // Use max rank + 1 (not len) to avoid ID collisions with sparse/non-contiguous ranks
-        let num_base_tokens = encoder.values().max().map_or(0, |&m| m + 1) as usize;
-        let special_tokens = load_special_tokens(directory, num_base_tokens)?;
+        let special_tokens = load_special_tokens_for_model(file_path, &encoder)?;
         let special_token_ids: HashSet<u32> = special_tokens.values().copied().collect();
 
         let bpe = CoreBPE::new(encoder, special_tokens, pattern)
@@ -75,6 +73,18 @@ impl TikTokenTokenizer {
             special_token_ids,
         })
     }
+}
+
+pub(crate) fn load_special_token_boundaries(path: &Path) -> Result<HashMap<u32, String>> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| Error::msg(format!("Invalid tokenizer path: {}", path.display())))?;
+    let encoder = parse_tiktoken_file(path_str)?;
+    let special_tokens = load_special_tokens_for_model(path, &encoder)?;
+    Ok(special_tokens
+        .into_iter()
+        .map(|(token, id)| (id, token))
+        .collect())
 }
 
 impl Encoder for TikTokenTokenizer {
@@ -229,6 +239,17 @@ fn load_special_tokens(directory: &Path, num_base_tokens: usize) -> Result<FxHas
     }
 
     Ok(special_tokens)
+}
+
+fn load_special_tokens_for_model(
+    file_path: &Path,
+    encoder: &FxHashMap<Vec<u8>, u32>,
+) -> Result<FxHashMap<String, u32>> {
+    let directory = file_path
+        .parent()
+        .ok_or_else(|| Error::msg("Cannot determine parent directory of tiktoken file"))?;
+    let num_base_tokens = encoder.values().max().map_or(0, |&m| m + 1) as usize;
+    load_special_tokens(directory, num_base_tokens)
 }
 
 #[cfg(test)]

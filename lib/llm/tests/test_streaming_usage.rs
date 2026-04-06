@@ -108,6 +108,7 @@ fn build_backend_outputs_with_cached_tokens(cached_tokens: Option<u32>) -> Vec<B
             finish_reason: None,
             stop_reason: None,
             index: Some(0),
+            extra_args: None,
             completion_usage: None,
             disaggregated_params: None,
         },
@@ -121,6 +122,7 @@ fn build_backend_outputs_with_cached_tokens(cached_tokens: Option<u32>) -> Vec<B
             finish_reason: None,
             stop_reason: None,
             index: Some(0),
+            extra_args: None,
             completion_usage: None,
             disaggregated_params: None,
         },
@@ -134,6 +136,7 @@ fn build_backend_outputs_with_cached_tokens(cached_tokens: Option<u32>) -> Vec<B
             finish_reason: Some(FinishReason::Stop),
             stop_reason: None,
             index: Some(0),
+            extra_args: None,
             completion_usage: cached_tokens.map(|ct| AoaiCompletionUsage {
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -190,6 +193,8 @@ fn create_chat_request(
         common: Default::default(),
         nvext: None,
         chat_template_args: None,
+        request_id: None,
+        rid: None,
         media_io_kwargs: None,
         unsupported_fields: Default::default(),
     }
@@ -520,6 +525,8 @@ fn create_nonstreaming_chat_request() -> NvCreateChatCompletionRequest {
         common: Default::default(),
         nvext: None,
         chat_template_args: None,
+        request_id: None,
+        rid: None,
         media_io_kwargs: None,
         unsupported_fields: Default::default(),
     }

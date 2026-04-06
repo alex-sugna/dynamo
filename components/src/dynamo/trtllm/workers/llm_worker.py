@@ -14,6 +14,7 @@ import os
 import sys
 from typing import Optional
 
+from aiohttp import web
 from prometheus_client import REGISTRY
 from tensorrt_llm.llmapi import (
     CapacitySchedulerPolicy,
@@ -60,6 +61,76 @@ from dynamo.trtllm.utils.trtllm_utils import deep_update
 
 # Default buffer size for kv cache events.
 DEFAULT_KV_EVENT_BUFFER_MAX_SIZE = 1024
+
+# Default port for profiling HTTP server
+DEFAULT_PROFILING_PORT = 8001
+
+
+async def create_profiling_server(
+    engine: TensorRTLLMEngine, port: int = DEFAULT_PROFILING_PORT
+) -> web.AppRunner:
+    """Create a simple HTTP server for profiling control.
+
+    Provides /start_profile and /stop_profile endpoints to control
+    torch profiling on the TensorRT-LLM engine.
+
+    Args:
+        engine: The TensorRTLLMEngine instance.
+        port: Port to listen on (default: 0, OS-assigned).
+
+    Returns:
+        The aiohttp AppRunner instance (caller must call cleanup()).
+    """
+
+    async def start_profile(request):
+        try:
+            data = await request.json() if request.body_exists else {}
+        except Exception:
+            data = {}
+
+        try:
+            result = engine.llm.start_profile(
+                output_dir=data.get("output_dir"),
+                with_stack=data.get("with_stack", True),
+                record_shapes=data.get("record_shapes", False),
+                activities=data.get("activities", ["CPU", "CUDA"]),
+            )
+            logging.info(f"Profiling started successfully: {result}")
+            return web.json_response(result)
+        except Exception as e:
+            logging.error(f"Failed to start profiling: {e}")
+            return web.json_response(
+                {"success": False, "message": f"Failed to start profiling: {e}"},
+                status=500,
+            )
+
+    async def stop_profile(request):
+        try:
+            result = engine.llm.stop_profile()
+            logging.info(f"Profiling stopped successfully: {result}")
+            return web.json_response(result)
+        except Exception as e:
+            logging.error(f"Failed to stop profiling: {e}")
+            return web.json_response(
+                {"success": False, "message": f"Failed to stop profiling: {e}"},
+                status=500,
+            )
+
+    async def health(request):
+        return web.json_response({"status": "ok"})
+
+    app = web.Application()
+    app.router.add_route("*", "/start_profile", start_profile)
+    app.router.add_route("*", "/stop_profile", stop_profile)
+    app.router.add_route("*", "/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    actual_port = site._server.sockets[0].getsockname()[1]
+    logging.info(f"Profiling server started on port {actual_port}")
+    return runner
 
 
 async def get_engine_runtime_config(
@@ -465,62 +536,80 @@ async def init_llm_worker(
         # Get health check payload (checks env var and falls back to TensorRT-LLM default)
         health_check_payload = TrtllmHealthCheckPayload(tokenizer=tokenizer).to_dict()
 
-        if config.publish_events_and_metrics:
-            # Initialize and pass in the publisher to the request handler to
-            # publish events and metrics.
-            # Use model as fallback if served_model_name is not provided
-            model_name_for_metrics = config.served_model_name or config.model
-            metrics_labels = [
-                (
-                    prometheus_names.labels.MODEL,
-                    model_name_for_metrics,
-                ),  # OpenAI standard
-                (
-                    prometheus_names.labels.MODEL_NAME,
-                    model_name_for_metrics,
-                ),  # Native engine compatibility
-            ]
+        # Start profiling HTTP server after all engine/NIXL init is complete.
+        # Only one rank can bind a given port, so silently skip on port conflicts
+        # (rank 0 wins; profiling commands fan out to all workers via the executor).
+        profiling_port = int(
+            os.environ.get("DYNAMO_PROFILING_PORT", str(DEFAULT_PROFILING_PORT))
+        )
+        profiling_runner = None
+        try:
+            profiling_runner = await create_profiling_server(
+                engine, port=profiling_port
+            )
+        except OSError as e:
+            logging.warning(f"Profiling server not started (port {profiling_port}): {e}")
 
-            # Create worker-side publisher for consolidated events if consolidator is enabled
-            # This subscribes to consolidator's ZMQ output and publishes to NATS with worker_id
-            consolidator_publisher = None
-            if consolidator_output_endpoint:
-                # Use the connect endpoint directly (already provided by get_consolidator_endpoints)
-                consolidator_publisher = KvEventPublisher(
-                    endpoint=endpoint,
-                    kv_block_size=config.kv_block_size,
-                    zmq_endpoint=consolidator_output_connect_endpoint,
-                    zmq_topic="",
-                )
-                logging.info(
-                    f"Created worker-side publisher for consolidated events: "
-                    f"subscribing to {consolidator_output_connect_endpoint}, worker_id={endpoint.connection_id()}"
-                )
+        try:
+            if config.publish_events_and_metrics:
+                # Initialize and pass in the publisher to the request handler to
+                # publish events and metrics.
+                # Use model as fallback if served_model_name is not provided
+                model_name_for_metrics = config.served_model_name or config.model
+                metrics_labels = [
+                    (
+                        prometheus_names.labels.MODEL,
+                        model_name_for_metrics,
+                    ),  # OpenAI standard
+                    (
+                        prometheus_names.labels.MODEL_NAME,
+                        model_name_for_metrics,
+                    ),  # Native engine compatibility
+                ]
 
-            async with get_publisher(
-                endpoint,
-                engine,
-                int(endpoint.connection_id()),
-                config.kv_block_size,
-                metrics_labels,
-                component_gauges=component_gauges,
-                zmq_endpoint=trtllm_zmq_bind_endpoint,
-                enable_local_indexer=config.enable_local_indexer,
-                metrics_collector=metrics_collector,
-            ) as publisher:
-                handler_config.publisher = publisher
+                # Create worker-side publisher for consolidated events if consolidator is enabled
+                # This subscribes to consolidator's ZMQ output and publishes to NATS with worker_id
+                consolidator_publisher = None
+                if consolidator_output_endpoint:
+                    # Use the connect endpoint directly (already provided by get_consolidator_endpoints)
+                    consolidator_publisher = KvEventPublisher(
+                        endpoint=endpoint,
+                        kv_block_size=config.kv_block_size,
+                        zmq_endpoint=consolidator_output_connect_endpoint,
+                        zmq_topic="",
+                    )
+                    logging.info(
+                        f"Created worker-side publisher for consolidated events: "
+                        f"subscribing to {consolidator_output_connect_endpoint}, worker_id={endpoint.connection_id()}"
+                    )
+
+                async with get_publisher(
+                    endpoint,
+                    engine,
+                    int(endpoint.connection_id()),
+                    config.kv_block_size,
+                    metrics_labels,
+                    component_gauges=component_gauges,
+                    zmq_endpoint=trtllm_zmq_bind_endpoint,
+                    enable_local_indexer=config.enable_local_indexer,
+                    metrics_collector=metrics_collector,
+                ) as publisher:
+                    handler_config.publisher = publisher
+                    handler = RequestHandlerFactory().get_request_handler(handler_config)
+                    await endpoint.serve_endpoint(
+                        handler.generate,
+                        metrics_labels=metrics_labels,
+                        health_check_payload=health_check_payload,
+                    )
+
+                # Shutdown consolidator publisher if it was created
+                if consolidator_publisher:
+                    consolidator_publisher.shutdown()
+            else:
                 handler = RequestHandlerFactory().get_request_handler(handler_config)
                 await endpoint.serve_endpoint(
-                    handler.generate,
-                    metrics_labels=metrics_labels,
-                    health_check_payload=health_check_payload,
+                    handler.generate, health_check_payload=health_check_payload
                 )
-
-            # Shutdown consolidator publisher if it was created
-            if consolidator_publisher:
-                consolidator_publisher.shutdown()
-        else:
-            handler = RequestHandlerFactory().get_request_handler(handler_config)
-            await endpoint.serve_endpoint(
-                handler.generate, health_check_payload=health_check_payload
-            )
+        finally:
+            if profiling_runner:
+                await profiling_runner.cleanup()

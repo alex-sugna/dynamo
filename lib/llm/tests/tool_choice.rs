@@ -39,6 +39,8 @@ fn create_test_request() -> NvCreateChatCompletionRequest {
         common: Default::default(),
         nvext: None,
         chat_template_args: None,
+        request_id: None,
+        rid: None,
         media_io_kwargs: None,
         unsupported_fields: Default::default(),
     }
@@ -132,6 +134,7 @@ fn build_backend_output(text: &str) -> BackendOutput {
         finish_reason: Some(common::FinishReason::Stop),
         stop_reason: None,
         index: Some(0),
+        extra_args: None,
         completion_usage: None,
         disaggregated_params: None,
     }
@@ -300,6 +303,7 @@ async fn test_streaming_named_tool_buffers_until_finish() {
             },
             stop_reason: None,
             index: Some(0),
+            extra_args: None,
             completion_usage: None,
             disaggregated_params: None,
         };
@@ -367,6 +371,7 @@ async fn test_streaming_required_tool_parallel() {
             },
             stop_reason: None,
             index: Some(0),
+            extra_args: None,
             completion_usage: None,
             disaggregated_params: None,
         };
@@ -436,6 +441,7 @@ fn test_no_tool_choice_outputs_normal_text() {
         finish_reason: None,
         stop_reason: None,
         index: Some(0),
+        extra_args: None,
         completion_usage: None,
         disaggregated_params: None,
     };

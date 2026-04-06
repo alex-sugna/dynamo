@@ -81,6 +81,9 @@ pub struct PrefillResult {
     /// Prompt token details produced during prefill
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<dynamo_async_openai::types::PromptTokensDetails>,
+    /// Cached tokens reported by prefill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
 }
 
 /// Optional multimodal routing-only data.

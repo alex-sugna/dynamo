@@ -783,6 +783,8 @@ async fn test_nv_custom_client() {
         common: Default::default(),
         nvext: None,
         chat_template_args: None,
+        request_id: None,
+        rid: None,
         media_io_kwargs: None,
         unsupported_fields: Default::default(),
     };
@@ -825,6 +827,8 @@ async fn test_nv_custom_client() {
         common: Default::default(),
         nvext: None,
         chat_template_args: None,
+        request_id: None,
+        rid: None,
         media_io_kwargs: None,
         unsupported_fields: Default::default(),
     };
@@ -868,6 +872,8 @@ async fn test_nv_custom_client() {
         common: Default::default(),
         nvext: None,
         chat_template_args: None,
+        request_id: None,
+        rid: None,
         media_io_kwargs: None,
         unsupported_fields: Default::default(),
     };

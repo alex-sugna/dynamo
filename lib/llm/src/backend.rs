@@ -134,6 +134,9 @@ impl
 
         let prompt_token_ids = request.token_ids.clone();
 
+        // Capture extra_args from request (e.g., cached_tokens from prefill) to inject into first output
+        let request_extra_args = request.extra_args.clone();
+
         // TODO: Consider updating default to true to match behavior of other frameworks
         let skip_special_tokens = request.output_options.skip_special_tokens.unwrap_or(false);
 
@@ -283,9 +286,31 @@ impl
         .fuse();
 
         // convert stream of processed Annotated<LLMEngineOutput> to Annotated<BackendOutput>
+        // Merge request's extra_args (e.g., request_id, rid) with engine's extra_args (e.g., cached_tokens)
         //let mdcsum = self.mdcsum.clone();
+        let mut first_chunk = true;
         let stream = processed_stream.map(move |output| {
             output.map_data(|data| {
+                let extra_args = if first_chunk {
+                    first_chunk = false;
+                    match (&request_extra_args, &data.extra_args) {
+                        (Some(req_args), Some(engine_args)) => {
+                            let mut merged = req_args.clone();
+                            if let (Some(req_obj), Some(engine_obj)) = (merged.as_object_mut(), engine_args.as_object()) {
+                                for (key, value) in engine_obj {
+                                    req_obj.insert(key.clone(), value.clone());
+                                }
+                            }
+                            Some(merged)
+                        }
+                        (Some(req_args), None) => Some(req_args.clone()),
+                        (None, Some(engine_args)) => Some(engine_args.clone()),
+                        (None, None) => None,
+                    }
+                } else {
+                    data.extra_args
+                };
+
                 Ok(BackendOutput {
                     token_ids: data.token_ids,
                     tokens: data.tokens.unwrap_or_default(),
@@ -297,6 +322,7 @@ impl
                     stop_reason: data.stop_reason,
                     //mdcsum: mdcsum.clone(),
                     index: data.index,
+                    extra_args,
                     completion_usage: data.completion_usage,
                     disaggregated_params: data.disaggregated_params,
                 })

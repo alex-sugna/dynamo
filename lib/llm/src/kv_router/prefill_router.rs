@@ -5,13 +5,17 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
-use futures::StreamExt;
+use futures::{
+    StreamExt,
+    stream::{self},
+};
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use dynamo_runtime::{
     component::Endpoint,
+    engine::ResponseStream,
     pipeline::{
         AsyncEngine, AsyncEngineContextProvider, Context, ManyOut, Operator, PushRouter,
         RouterMode, ServerStreamingEngine, SingleIn, async_trait,
@@ -60,7 +64,10 @@ enum PrefillOutcome {
     /// Bootstrap optimization: prefill spawned in background, bootstrap info ready
     Bootstrap(BootstrapInfo),
     /// Synchronous prefill completed with result
-    Completed(PrefillResult),
+    Completed {
+        result: PrefillResult,
+        first_client_delta: Option<Annotated<LLMEngineOutput>>,
+    },
 }
 
 /// The inner router used by PrefillRouter
@@ -124,6 +131,39 @@ pub struct PrefillRouter {
 }
 
 impl PrefillRouter {
+    fn extract_trtllm_prefill_first_client_delta(
+        first_output: &Annotated<LLMEngineOutput>,
+    ) -> Option<Annotated<LLMEngineOutput>> {
+        let output = first_output.data.as_ref()?;
+        if output.token_ids.is_empty() {
+            return None;
+        }
+
+        let disaggregated_params = output.disaggregated_params.as_ref()?;
+        let is_trtllm_prefill = disaggregated_params.get("opaque_state").is_some()
+            || disaggregated_params.get("first_gen_tokens").is_some()
+            || disaggregated_params.get("first_gen_log_probs").is_some();
+        if !is_trtllm_prefill {
+            return None;
+        }
+
+        let mut client_output = output.clone();
+        client_output.finish_reason = None;
+        client_output.stop_reason = None;
+        client_output.disaggregated_params = None;
+
+        Some(first_output.clone().transfer(Some(client_output)))
+    }
+
+    fn prepend_prefill_delta(
+        decode_stream: ManyOut<Annotated<LLMEngineOutput>>,
+        first_delta: Option<Annotated<LLMEngineOutput>>,
+    ) -> ManyOut<Annotated<LLMEngineOutput>> {
+        let context = decode_stream.context();
+        let combined_stream = stream::iter(first_delta).chain(decode_stream);
+        ResponseStream::new(Box::pin(combined_stream), context)
+    }
+
     /// Create a disabled prefill router that will never activate (passthrough only)
     pub fn disabled(
         model_manager: Arc<ModelManager>,
@@ -373,13 +413,20 @@ impl PrefillRouter {
     /// allowing subsequent `set_phase` calls to proceed. This is used in the bootstrap
     /// optimization path to ensure `record_worker_full` completes before the phase changes.
     ///
-    /// Returns (PrefillResult, Option<(worker_id, dp_rank)>).
+    /// Returns (PrefillResult, Option<first_client_delta>, Option<(worker_id, dp_rank)>).
     async fn execute_prefill(
         router: Option<InnerPrefillRouter>,
         request: SingleIn<PreprocessedRequest>,
         target_worker: Option<u64>,
         phase_permit: Option<OwnedSemaphorePermit>,
-    ) -> Result<(PrefillResult, Option<(u64, u32)>), PrefillError> {
+    ) -> Result<
+        (
+            PrefillResult,
+            Option<Annotated<LLMEngineOutput>>,
+            Option<(u64, u32)>,
+        ),
+        PrefillError,
+    > {
         let router = router.ok_or(PrefillError::NotActivated)?;
         let mut prefill_response = router
             .generate_to_worker(request, target_worker)
@@ -437,6 +484,7 @@ impl PrefillRouter {
                 "Prefill router output missing disaggregated_params".to_string(),
             ));
         };
+        let first_client_delta = Self::extract_trtllm_prefill_first_client_delta(&first_output);
 
         // Extract prefill worker ID and dp_rank from disaggregated_params
         let prefill_worker_info =
@@ -453,11 +501,21 @@ impl PrefillRouter {
                         .unwrap_or(0);
                     Some((worker_id, dp_rank))
                 });
+        // Extract cached_tokens from prefill's extra_args (actual KV cache hits)
+        let cached_tokens = output
+            .extra_args
+            .as_ref()
+            .and_then(|ea| ea.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
         Ok((
             PrefillResult {
                 disaggregated_params,
                 prompt_tokens_details,
+                cached_tokens,
             },
+            first_client_delta,
             prefill_worker_info,
         ))
     }
@@ -663,7 +721,7 @@ impl
 
                 // In Direct mode, pass preselected_worker so execute_prefill uses
                 // router.direct() instead of router.generate() (which bails in Direct mode).
-                let (result, _worker_info) = Self::execute_prefill(
+                let (result, first_client_delta, _worker_info) = Self::execute_prefill(
                     self.prefill_router.get().cloned(),
                     prefill_context,
                     preselected_worker,
@@ -671,7 +729,10 @@ impl
                 )
                 .await?;
 
-                Ok(PrefillOutcome::Completed(result))
+                Ok(PrefillOutcome::Completed {
+                    result,
+                    first_client_delta,
+                })
             }
         }
         .await;
@@ -699,15 +760,28 @@ impl
                 }
 
                 let mut decode_req = req;
-
-                match outcome {
+                let first_client_delta = match outcome {
                     PrefillOutcome::Bootstrap(info) => {
                         decode_req.bootstrap_info = Some(info);
+                        None
                     }
-                    PrefillOutcome::Completed(result) => {
+                    PrefillOutcome::Completed {
+                        result,
+                        first_client_delta,
+                    } => {
+                        // Inject prefill's cached_tokens into decode request's extra_args
+                        // This is the correct semantic value - decode worker won't see original prompt
+                        if let Some(ct) = result.cached_tokens {
+                            let mut extra = decode_req.extra_args.take()
+                                .and_then(|v| if v.is_object() { Some(v) } else { None })
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            extra["prefill_cached_tokens"] = serde_json::json!(ct);
+                            decode_req.extra_args = Some(extra);
+                        }
                         decode_req.prefill_result = Some(result);
+                        first_client_delta
                     }
-                }
+                };
 
                 // Restore original max_tokens for decode
                 decode_req.stop_conditions.max_tokens = original_max_tokens;
@@ -737,7 +811,34 @@ impl
 
                 // Map the modified request through with preserved context
                 let decode_request = context.map(|_| decode_req);
-                next.generate(decode_request).await
+                let decode_stream = next.generate(decode_request).await?;
+                let response_context = decode_stream.context();
+                let prefill_cached_tokens = match &first_client_delta {
+                    Some(delta) => delta.data.as_ref()
+                        .and_then(|d| d.extra_args.as_ref())
+                        .and_then(|ea| ea.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
+                    None => None,
+                };
+                let mut first_decode_chunk = true;
+                let decode_stream = decode_stream.map(move |mut output| {
+                    if first_decode_chunk {
+                        first_decode_chunk = false;
+                        if let Some(prefill_cached_tokens) = prefill_cached_tokens
+                            && let Some(ref mut data) = output.data
+                        {
+                            let mut extra = data.extra_args.take().unwrap_or_else(|| serde_json::json!({}));
+                            extra["prefill_cached_tokens"] = serde_json::json!(prefill_cached_tokens);
+                            data.extra_args = Some(extra);
+                        }
+                    }
+                    output
+                });
+                Ok(Self::prepend_prefill_delta(
+                    ResponseStream::new(Box::pin(decode_stream), response_context),
+                    first_client_delta,
+                ))
             }
             Err(PrefillError::NotActivated) => {
                 if !self.decode_fallback {
@@ -776,5 +877,152 @@ impl
                 next.generate(context.map(|_| fallback_req)).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::common::llm_backend::FinishReason;
+    use dynamo_async_openai::types::CompletionUsage;
+    use serde_json::json;
+
+    fn make_output(
+        token_ids: Vec<u32>,
+        disaggregated_params: Option<serde_json::Value>,
+        finish_reason: Option<FinishReason>,
+    ) -> Annotated<LLMEngineOutput> {
+        Annotated::from_data(LLMEngineOutput {
+            token_ids,
+            tokens: Some(vec![Some("prefill".to_string())]),
+            text: Some("prefill".to_string()),
+            output_type: Default::default(),
+            content_parts: None,
+            cum_log_probs: None,
+            log_probs: Some(vec![-0.25]),
+            top_logprobs: None,
+            finish_reason,
+            stop_reason: None,
+            index: Some(0),
+            disaggregated_params,
+            extra_args: None,
+            completion_usage: Some(CompletionUsage {
+                prompt_tokens: 5,
+                completion_tokens: 1,
+                total_tokens: 6,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+        })
+    }
+
+    #[test]
+    fn test_extract_trtllm_prefill_first_client_delta_sanitizes_terminal_fields() {
+        let first_output = make_output(
+            vec![42],
+            Some(json!({
+                "opaque_state": "Zm9v",
+                "first_gen_tokens": [42],
+            })),
+            Some(FinishReason::Length),
+        );
+
+        let client_delta =
+            PrefillRouter::extract_trtllm_prefill_first_client_delta(&first_output)
+                .expect("expected TRTLLM prefill delta");
+        let data = client_delta.data.expect("expected data");
+
+        assert_eq!(data.token_ids, vec![42]);
+        assert_eq!(data.text.as_deref(), Some("prefill"));
+        assert_eq!(data.log_probs, Some(vec![-0.25]));
+        assert!(data.finish_reason.is_none());
+        assert!(data.stop_reason.is_none());
+        assert!(data.disaggregated_params.is_none());
+        assert_eq!(
+            data.completion_usage.expect("usage").prompt_tokens,
+            5
+        );
+    }
+
+    #[test]
+    fn test_extract_trtllm_prefill_first_client_delta_skips_non_trtllm_output() {
+        let first_output = make_output(
+            vec![7],
+            Some(json!({
+                "bootstrap_host": "127.0.0.1",
+                "bootstrap_port": 5000,
+                "bootstrap_room": 1,
+            })),
+            None,
+        );
+
+        assert!(
+            PrefillRouter::extract_trtllm_prefill_first_client_delta(&first_output)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepend_prefill_delta_puts_prefill_chunk_before_decode_stream() {
+        let first_delta = PrefillRouter::extract_trtllm_prefill_first_client_delta(&make_output(
+            vec![101],
+            Some(json!({
+                "opaque_state": "Zm9v",
+                "first_gen_tokens": [101],
+            })),
+            Some(FinishReason::Length),
+        ));
+        let decode_output = make_output(vec![102], None, Some(FinishReason::Stop));
+
+        let ctx = Context::with_id((), "test-request".to_string()).context();
+        let decode_stream =
+            ResponseStream::new(Box::pin(stream::iter(vec![decode_output])), ctx);
+        let mut combined = PrefillRouter::prepend_prefill_delta(decode_stream, first_delta);
+
+        let first = combined.next().await.expect("missing prepended chunk");
+        let first_data = first.data.expect("missing prepended data");
+        assert_eq!(first_data.token_ids, vec![101]);
+        assert!(first_data.finish_reason.is_none());
+
+        let second = combined.next().await.expect("missing decode chunk");
+        let second_data = second.data.expect("missing decode data");
+        assert_eq!(second_data.token_ids, vec![102]);
+        assert_eq!(second_data.finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn test_cached_tokens_extracted_from_extra_args() {
+        let output = Annotated {
+            id: None,
+            data: Some(LLMEngineOutput {
+                token_ids: vec![1],
+                text: Some("tok".to_string()),
+                tokens: None,
+                cum_log_probs: None,
+                log_probs: None,
+                top_logprobs: None,
+                finish_reason: None,
+                stop_reason: None,
+                disaggregated_params: Some(json!({"opaque_state": "Zm9v", "first_gen_tokens": [1]})),
+                index: None,
+                extra_args: Some(json!({"cached_tokens": 17})),
+                completion_usage: None,
+                output_type: Default::default(),
+                content_parts: None,
+            }),
+            event: None,
+            comment: None,
+            error: None,
+        };
+
+        let cached = output
+            .data
+            .as_ref()
+            .and_then(|d| d.extra_args.as_ref())
+            .and_then(|ea| ea.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
+        assert_eq!(cached, Some(17));
     }
 }

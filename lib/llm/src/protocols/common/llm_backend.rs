@@ -97,6 +97,10 @@ pub struct BackendOutput {
     // Index field for batch requests to match OpenAI format
     pub index: Option<u32>,
 
+    /// Additional arguments for extensibility (e.g., cached_tokens)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_args: Option<serde_json::Value>,
+
     // Token usage information
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_usage: Option<CompletionUsage>,
