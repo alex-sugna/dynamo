@@ -128,9 +128,16 @@ async def async_main():
     config, vllm_flags = parse_args()
     dump_config(config.dump_config_to, config)
     os.environ["DYN_EVENT_PLANE"] = config.event_plane
+    os.environ["DYN_ENABLE_TOKENIZER_CACHE"] = (
+        "true" if config.enable_tokenizer_cache else "false"
+    )
     logger.info(
         f"Request migration {'enabled' if config.migration_limit > 0 else 'disabled'} "
         f"(limit: {config.migration_limit})"
+    )
+    logger.info(
+        "Tokenizer cache %s",
+        "enabled" if config.enable_tokenizer_cache else "disabled",
     )
     # Warn if DYN_SYSTEM_PORT is set (frontend doesn't use system metrics server)
     if os.environ.get("DYN_SYSTEM_PORT"):

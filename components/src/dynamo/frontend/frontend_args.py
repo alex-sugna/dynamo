@@ -40,6 +40,7 @@ class FrontendConfig(ConfigBase):
     """Configuration for the Dynamo frontend."""
 
     interactive: bool
+    enable_tokenizer_cache: bool
     kv_cache_block_size: Optional[int]
     http_host: str
     http_port: int
@@ -121,6 +122,17 @@ class FrontendArgGroup(ArgGroup):
             action=argparse.BooleanOptionalAction,
             default=env_or_default("DYN_INTERACTIVE", False),
             help="Interactive text chat.\nenv var: DYN_INTERACTIVE",
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--tokenizer-cache",
+            env_var="DYN_ENABLE_TOKENIZER_CACHE",
+            default=True,
+            help=(
+                "Enable/disable tokenizer cache. Use --tokenizer-cache to enable "
+                "(default) or --no-tokenizer-cache to disable."
+            ),
+            dest="enable_tokenizer_cache",
         )
 
         add_argument(

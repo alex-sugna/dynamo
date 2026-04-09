@@ -72,6 +72,26 @@ use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 pub const ANNOTATION_FORMATTED_PROMPT: &str = "formatted_prompt";
 pub const ANNOTATION_TOKEN_IDS: &str = "token_ids";
 pub const ANNOTATION_LLM_METRICS: &str = "llm_metrics";
+const TOKENIZER_CACHE_ENV_VAR: &str = "DYN_ENABLE_TOKENIZER_CACHE";
+
+fn tokenizer_cache_enabled() -> bool {
+    match std::env::var(TOKENIZER_CACHE_ENV_VAR) {
+        Ok(value) => match dynamo_runtime::config::parse_bool(&value) {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                tracing::warn!(
+                    env_var = TOKENIZER_CACHE_ENV_VAR,
+                    value,
+                    %error,
+                    "Invalid tokenizer cache override; defaulting to enabled"
+                );
+                true
+            }
+        },
+        Err(_) => true,
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LLMMetricAnnotation {
     pub input_tokens: usize,
@@ -171,13 +191,20 @@ impl OpenAIPreprocessor {
     ) -> Result<Arc<Self>> {
         let mdcsum = mdc.mdcsum().to_string();
         let tokenizer: Arc<dyn Tokenizer> = (*tokenizer).clone();
-        let tokenizer_cache = TokenizerCache::from_model_card(&mdc).inspect_err(|error| {
-            tracing::warn!(
-                model = %mdc.display_name,
-                %error,
-                "Failed to initialize tokenizer cache; continuing without it"
-            );
-        }).ok().flatten();
+        let tokenizer_cache = if tokenizer_cache_enabled() {
+            TokenizerCache::from_model_card(&mdc)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        model = %mdc.display_name,
+                        %error,
+                        "Failed to initialize tokenizer cache; continuing without it"
+                    );
+                })
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let lora_name = mdc.lora.as_ref().map(|l| l.name.clone());
         let Some(ref model_info) = mdc.model_info else {
             anyhow::bail!(
