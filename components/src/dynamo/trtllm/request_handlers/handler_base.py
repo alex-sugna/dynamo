@@ -685,6 +685,14 @@ class HandlerBase(BaseGenerativeHandler):
             raise ValueError("Disaggregated params are required for decode mode")
 
         num_output_tokens_so_far = 0
+        # [together] Skip first_gen_tokens already returned by prefill early-return path
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and disaggregated_params is not None
+            and disaggregated_params.first_gen_tokens is not None
+        ):
+            num_output_tokens_so_far = len(disaggregated_params.first_gen_tokens)
+        num_output_tokens_so_far_initial = num_output_tokens_so_far
 
         sampling_params = self._override_sampling_params(
             self.default_sampling_params, request
@@ -905,10 +913,12 @@ class HandlerBase(BaseGenerativeHandler):
                                         "cached_tokens": int(cached_tokens),
                                     }
 
+                        # [together] Exclude prefill early-return tokens from decode's count
+                        completion_tokens = int(next_total_toks - num_output_tokens_so_far_initial)
                         out["completion_usage"] = {
                             "prompt_tokens": int(num_input_tokens),
-                            "completion_tokens": int(next_total_toks),
-                            "total_tokens": int(num_input_tokens + next_total_toks),
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": int(num_input_tokens) + completion_tokens,
                             "prompt_tokens_details": prompt_tokens_details,
                         }
 
