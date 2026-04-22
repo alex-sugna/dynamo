@@ -580,23 +580,34 @@ impl OpenAIPreprocessor {
             }
         }
 
-        // Validate prompt token count against model's context length
+        // Validate prompt token count (and prompt + max_tokens) against model's context length
         if let Some(count) = token_count {
-            Self::validate_token_count(count, self.context_length)?;
+            let max_tokens = request.extract_stop_conditions()
+                .ok()
+                .and_then(|sc| sc.max_tokens);
+            Self::validate_token_count(count, self.context_length, max_tokens)?;
         }
 
         Ok(annotations)
     }
 
-    /// Validate that the prompt token count does not consume the model's entire context length.
-    /// Returns an error if the prompt leaves no room for output tokens.
-    fn validate_token_count(token_count: usize, context_length: u32) -> Result<()> {
+    /// Validate that the prompt token count does not consume the model's entire context length,
+    /// and that the combined prompt + requested output does not exceed it.
+    fn validate_token_count(
+        token_count: usize,
+        context_length: u32,
+        max_tokens: Option<u32>,
+    ) -> Result<()> {
         let max_len = context_length as usize;
         // max_len == 0 means context_length was not configured (model_card.rs defaults
         // to 0 when max_position_embeddings is absent), so skip validation.
+        if max_len == 0 {
+            return Ok(());
+        }
+
         // Use >= because context_length is the total budget (input + output): if the
         // prompt alone fills it, there is zero room for output tokens.
-        if max_len > 0 && token_count >= max_len {
+        if token_count >= max_len {
             return Err(DynamoError::builder()
                 .error_type(ErrorType::InvalidArgument)
                 .message(format!(
@@ -608,6 +619,21 @@ impl OpenAIPreprocessor {
                 .build()
                 .into());
         }
+
+        if let Some(max_output_tokens) = max_tokens {
+            let total_tokens = token_count + max_output_tokens as usize;
+            if total_tokens > max_len + 1 {
+                return Err(DynamoError::builder()
+                    .error_type(ErrorType::InvalidArgument)
+                    .message(format!(
+                        "The input token count ({}) and the requested output count ({}) exceeds the model's maximum context length ({})",
+                        token_count, max_output_tokens, max_len,
+                    ))
+                    .build()
+                    .into());
+            }
+        }
+
         Ok(())
     }
 
