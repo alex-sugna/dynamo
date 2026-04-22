@@ -118,6 +118,8 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
         let min_p = validate_range(CommonExtProvider::get_min_p(self), &MIN_P_RANGE)
             .map_err(|e| anyhow::anyhow!("Error validating min_p: {}", e))?;
 
+        let dynamic_sampling = CommonExtProvider::get_dynamic_sampling(self);
+
         if let Some(nvext) = self.nvext() {
             let greedy = nvext.greed_sampling.unwrap_or(false);
             if greedy {
@@ -164,6 +166,7 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
             length_penalty: None,
             guided_decoding,
             include_stop_str_in_output,
+            dynamic_sampling,
         })
     }
 }

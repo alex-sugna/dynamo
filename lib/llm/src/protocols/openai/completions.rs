@@ -227,6 +227,10 @@ impl CommonExtProvider for NvCreateCompletionRequest {
     fn get_skip_special_tokens(&self) -> Option<bool> {
         self.common.skip_special_tokens
     }
+
+    fn get_dynamic_sampling(&self) -> Option<crate::protocols::common::DynamicSamplingOption> {
+        self.common.dynamic_sampling.clone()
+    }
 }
 
 impl OpenAIStopConditionsProvider for NvCreateCompletionRequest {

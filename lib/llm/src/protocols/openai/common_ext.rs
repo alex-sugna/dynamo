@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
+use crate::protocols::common::DynamicSamplingOption;
+
 /// Common extensions for OpenAI API requests that are not part of the standard OpenAI spec
 /// but are commonly needed across different request types.
 #[derive(ToSchema, Serialize, Deserialize, Builder, Validate, Debug, Clone, Default)]
@@ -81,6 +83,12 @@ pub struct CommonExt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub skip_special_tokens: Option<bool>,
+
+    /// Dynamic sampling configuration that changes sampling parameters
+    /// when a trigger string is encountered during generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub dynamic_sampling: Option<DynamicSamplingOption>,
 }
 
 impl CommonExt {
@@ -111,6 +119,9 @@ pub trait CommonExtProvider {
 
     /// Output Options
     fn get_skip_special_tokens(&self) -> Option<bool>;
+
+    /// Dynamic Sampling Options
+    fn get_dynamic_sampling(&self) -> Option<DynamicSamplingOption>;
 }
 
 #[cfg(test)]
@@ -206,6 +217,7 @@ mod tests {
             guided_decoding_backend: None,
             guided_whitespace_pattern: None,
             skip_special_tokens: None,
+            dynamic_sampling: None,
         };
         assert!(common_ext.validate().is_ok());
     }

@@ -337,6 +337,46 @@ pub struct SamplingOptions {
 
     /// Guided Decoding Options
     pub guided_decoding: Option<GuidedDecodingOptions>,
+
+    /// Dynamic sampling configuration that changes sampling parameters
+    /// when a trigger string is encountered during generation.
+    pub dynamic_sampling: Option<DynamicSamplingOption>,
+}
+
+/// A single dynamic sampling configuration that changes sampling parameters
+/// when a trigger string is encountered during generation.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DynamicSamplingOption {
+    /// Trigger string for dynamic sampling
+    pub trigger: String,
+
+    /// Temperature override when trigger is matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Top-k override when trigger is matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+
+    /// Top-p override when trigger is matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+
+    /// Min-p override when trigger is matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+
+    /// Repetition penalty override when trigger is matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+
+    /// Presence penalty override when trigger is matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+
+    /// Frequency penalty override when trigger is matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
 }
 
 /// Guided Decoding Options
