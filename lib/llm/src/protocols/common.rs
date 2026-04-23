@@ -16,6 +16,7 @@
 use anyhow::Result;
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::TokenIdType;
 
@@ -345,7 +346,7 @@ pub struct SamplingOptions {
 
 /// A single dynamic sampling configuration that changes sampling parameters
 /// when a trigger string is encountered during generation.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(ToSchema, Serialize, Deserialize, Debug, Clone)]
 pub struct DynamicSamplingOption {
     /// Trigger string for dynamic sampling
     pub trigger: String,

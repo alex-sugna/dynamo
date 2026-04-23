@@ -28,7 +28,7 @@ from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi.llm import SamplingParams
-from tensorrt_llm.sampling_params import GuidedDecodingParams
+from tensorrt_llm.sampling_params import DynamicSamplingParams, GuidedDecodingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
 from dynamo._core import Context
@@ -1018,6 +1018,10 @@ class HandlerBase(BaseGenerativeHandler):
                 json_object=guided_decoding.get("json_object", False),
                 structural_tag=guided_decoding.get("structural_tag"),
             )
+
+        dynamic_sampling = overrides.pop("dynamic_sampling", None)
+        if dynamic_sampling is not None and isinstance(dynamic_sampling, dict):
+            overrides["dynamic_sampling"] = DynamicSamplingParams(**dynamic_sampling)
 
         # NOTE: using `dataclasses.replace` has several benefits over a `setattr` based approach:
         # 1. it catches unsupported fields / attributes.
