@@ -700,7 +700,7 @@ class HandlerBase(BaseGenerativeHandler):
 
         # Additional sampling params in output options
         output_options = request.get("output_options", {})
-        if output_options:
+        if output_options and not os.getenv("DYNAMO_DISABLE_LOGPROBS", ""):
             logprobs_value = output_options.get("logprobs")
 
             # Handle logprobs
@@ -1022,6 +1022,11 @@ class HandlerBase(BaseGenerativeHandler):
         dynamic_sampling = overrides.pop("dynamic_sampling", None)
         if dynamic_sampling is not None and isinstance(dynamic_sampling, dict):
             overrides["dynamic_sampling"] = DynamicSamplingParams(**dynamic_sampling)
+
+        if os.getenv("DYNAMO_DISABLE_LOGPROBS", ""):
+            overrides.pop("logprobs", None)
+            overrides.pop("prompt_logprobs", None)
+            overrides.pop("dynamic_sampling", None)
 
         # NOTE: using `dataclasses.replace` has several benefits over a `setattr` based approach:
         # 1. it catches unsupported fields / attributes.
