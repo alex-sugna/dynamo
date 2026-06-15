@@ -36,6 +36,25 @@ use tokio_util::sync::CancellationToken;
 
 type InstanceMap = HashMap<Endpoint, Weak<Receiver<Vec<Instance>>>>;
 
+/// Per-endpoint shared "available instances" state. Pre-fix, each `Client::new` for
+/// the same endpoint built its own `instance_avail` ArcSwap + watch channel. That
+/// meant `report_instance_down` on one Client never propagated to another Client
+/// for the same endpoint — concretely, the decode push router's stall detector
+/// would inhibit a worker, but the prefill_router's live-partition filter (which
+/// reads from a `runtime_config_watch` joined map, fed by a different Client's
+/// `instance_avail_watcher`) wouldn't see the inhibition until etcd lease TTL
+/// (~600s) restored consistency. Sharing the state per-endpoint via the DRT
+/// closes that gap. See `Client::with_reconcile_interval`.
+#[derive(Clone, Debug)]
+pub struct SharedAvailState {
+    pub instance_avail: std::sync::Arc<arc_swap::ArcSwap<Vec<u64>>>,
+    pub instance_free: std::sync::Arc<arc_swap::ArcSwap<Vec<u64>>>,
+    pub instance_avail_tx: std::sync::Arc<tokio::sync::watch::Sender<Vec<u64>>>,
+    pub instance_avail_rx: tokio::sync::watch::Receiver<Vec<u64>>,
+}
+
+pub type AvailStateMap = HashMap<Endpoint, std::sync::Weak<SharedAvailState>>;
+
 /// Distributed [Runtime] which provides access to shared resources across the cluster, this includes
 /// communication protocols and transports.
 #[derive(Clone)]
@@ -64,6 +83,11 @@ pub struct DistributedRuntime {
     component_registry: component::Registry,
 
     instance_sources: Arc<tokio::sync::Mutex<InstanceMap>>,
+
+    /// Per-endpoint shared `instance_avail` state. See `SharedAvailState` docs.
+    /// Lookup is keyed by Endpoint; weak refs so the state drops when all
+    /// Clients for an endpoint are gone.
+    endpoint_avail_states: Arc<tokio::sync::Mutex<AvailStateMap>>,
 
     // Health Status
     system_health: Arc<parking_lot::Mutex<SystemHealth>>,
@@ -185,6 +209,7 @@ impl DistributedRuntime {
             discovery_metadata,
             component_registry,
             instance_sources: Arc::new(Mutex::new(HashMap::new())),
+            endpoint_avail_states: Arc::new(Mutex::new(HashMap::new())),
             metrics_registry: crate::MetricsRegistry::new(),
             system_health,
             request_plane,
@@ -388,6 +413,10 @@ impl DistributedRuntime {
 
     pub fn instance_sources(&self) -> Arc<Mutex<InstanceMap>> {
         self.instance_sources.clone()
+    }
+
+    pub fn endpoint_avail_states(&self) -> Arc<Mutex<AvailStateMap>> {
+        self.endpoint_avail_states.clone()
     }
 
     /// TODO: This is a temporary KV router measure for component/component.rs EventPublisher impl for

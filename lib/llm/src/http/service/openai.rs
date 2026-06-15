@@ -41,7 +41,11 @@ use super::{
     },
     service_v2,
 };
+use crate::admission::{self, Decision, RejectReason};
 use crate::engines::ValidateRequest;
+use crate::observability::{
+    AdmissionDecision, RequestLogScope, share_request_log, update_from_metric_annotation,
+};
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::nvext::apply_header_routing_overrides;
 use crate::protocols::openai::{
@@ -173,6 +177,23 @@ impl ErrorMessage {
 
     /// Internal Service Error
     /// Return this error when the service encounters an internal error.
+    /// 429 Too Many Requests response from admission control rejection.
+    /// Used by `from_anyhow` when it identifies the error chain as
+    /// originating from `KvSchedulerError::AdmissionRejected`.
+    fn admission_rejected_response(retry_after_secs: u32) -> ErrorResponse {
+        let code = StatusCode::TOO_MANY_REQUESTS;
+        (
+            code,
+            Json(ErrorMessage {
+                message: format!(
+                    "admission control: cluster at capacity, retry after {retry_after_secs}s"
+                ),
+                error_type: map_error_code_to_error_type(code),
+                code: code.as_u16(),
+            }),
+        )
+    }
+
     /// We should return a generic message to the client instead of the real error.
     /// Internal Services errors are the result of misconfiguration or bugs in the service.
     pub fn internal_server_error(msg: &str) -> ErrorResponse {
@@ -211,6 +232,42 @@ impl ErrorMessage {
     /// If successful, it will return the [`HttpError`] as an [`ErrorMessage::internal_server_error`]
     /// with the details of the error.
     pub fn from_anyhow(err: anyhow::Error, alt_msg: &str) -> ErrorResponse {
+        // [together] Map admission-control rejection to HTTP 429.
+        // Production rolled f188b5753 (the typed-downcast attempt). The
+        // typed `downcast_ref::<KvSchedulerError>()` doesn't fire across
+        // the PrefillError→anyhow→Box<dyn Error> wrapping chain — the
+        // original variant is obscured by the time `from_anyhow` sees
+        // it. So we ALSO match the Display message — the
+        // KvSchedulerError::AdmissionRejected variant's `#[error(...)]`
+        // text always contains the literal "admission control rejected"
+        // prefix, which propagates through anyhow chain formatting.
+        // Belt-and-suspenders: typed downcast first (in case it works
+        // through the chain), substring fallback second.
+        for cause in err.chain() {
+            if let Some(crate::kv_router::scheduler::KvSchedulerError::AdmissionRejected {
+                retry_after_secs,
+            }) = cause.downcast_ref::<crate::kv_router::scheduler::KvSchedulerError>()
+            {
+                return Self::admission_rejected_response(*retry_after_secs);
+            }
+        }
+        // Display the full error chain (anyhow's `{:#}` joins causes
+        // with ": ") and look for the marker text. Any future change
+        // to the AdmissionRejected variant's #[error(...)] must keep
+        // "admission control rejected" in the message.
+        let chain_text = format!("{err:#}");
+        if chain_text.contains("admission control rejected request") {
+            // Try to extract retry_after_secs from the message; fall
+            // back to 2 if parsing fails (matches the variant default).
+            let retry_after_secs = chain_text
+                .split("retry after ")
+                .nth(1)
+                .and_then(|s| s.split('s').next())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(2);
+            return Self::admission_rejected_response(retry_after_secs);
+        }
+
         // First check for PipelineError::ServiceOverloaded
         if let Some(pipeline_err) =
             err.downcast_ref::<dynamo_runtime::pipeline::error::PipelineError>()
@@ -502,7 +559,7 @@ async fn completions_single(
                 // Transpose Result<Option<T>> -> Option<Result<T>>
                 future::ready(result.transpose())
             });
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, None, stream_handle);
 
         let mut sse_stream = Sse::new(stream);
 
@@ -674,7 +731,7 @@ async fn completions_batch(
                 // Transpose Result<Option<T>> -> Option<Result<T>>
                 future::ready(result.transpose())
             });
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, None, stream_handle);
 
         let mut sse_stream = Sse::new(stream);
 
@@ -819,6 +876,14 @@ async fn handler_chat_completions(
     let mut request = Context::with_id(request, request_id);
     // Store timestamp in context registry for downstream access
     request.insert("dynamo_received_at", dynamo_received_at);
+    // Tag synthetic per-worker health probes so the per-request log can
+    // distinguish them from real client traffic without resorting to
+    // pattern-matching on URI / payload.
+    let is_health_check = headers
+        .get("x-health-check")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    request.insert("is_health_check", is_health_check);
     let context = request.context();
 
     // create the connection handles
@@ -1013,6 +1078,118 @@ async fn chat_completions(
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
+    // Per-request structured-log scope (axis 4 / observability). Drops at
+    // function exit; on drop emits one event to the
+    // `dynamo::observability::per_request` tracing target with
+    // {request_id, model, e2e_ms, status, ...}. Operator subscribes via
+    // RUST_LOG to capture them on a dedicated sink.
+    //
+    // The is_health_check tag is set in handler_chat_completions and
+    // threaded through the request Context.
+    let is_health_check = request
+        .get::<bool>("is_health_check")
+        .ok()
+        .map(|v| *v)
+        .unwrap_or(false);
+    let request_log = {
+        let mut s = RequestLogScope::new(request_id.clone(), model.clone());
+        s.mark_health_check(is_health_check);
+        // Attach the shared bypass-timestamp handle so the scope's Drop
+        // stamps `last_successful_request` only when the request actually
+        // completed end-to-end (status=200 + osl>0 + not a probe). This
+        // replaces the eager `state.record_successful_request()` calls
+        // that used to fire on stream construction / response-build, both
+        // of which could mark a degraded request as "healthy" and poison
+        // the e2e probe bypass.
+        s.with_last_successful_request(state.last_successful_request_handle());
+        share_request_log(s)
+    };
+
+    // Admission control (axis 2 v1). Skipped for health-check probes —
+    // they never count toward operator-facing capacity. The guard is
+    // dropped at function exit so an early-return (validation error,
+    // engine error) still releases the inflight slot.
+    let admission_policy_opt = if is_health_check {
+        None
+    } else {
+        admission::policy()
+    };
+    // Hold admission inflight slot for the full request lifetime, including
+    // the SSE stream's tail (decode generation). The streaming branch below
+    // takes ownership of this Option and hands it to monitor_for_disconnects;
+    // the non-streaming branch lets it drop at function return, after the
+    // JSON response is fully aggregated. Either way the counter decrements
+    // when "request is done", not when "HTTP headers are sent".
+    let mut admission_guard = if let Some(policy) = admission_policy_opt {
+        match policy.try_admit() {
+            Ok(guard) => {
+                admission::counters().incr("admit", 1);
+                admission::counters().record_event();
+                Some(guard)
+            }
+            Err(Decision::Reject {
+                reason,
+                retry_after_secs,
+            }) => {
+                let counter_name = match reason {
+                    RejectReason::AllWorkersOverloaded => "reject_all_workers_overloaded",
+                    RejectReason::RequestTooLarge => "reject_request_too_large",
+                    RejectReason::NoCapacityForIsl => "reject_no_capacity_for_isl",
+                };
+                admission::counters().incr(counter_name, 1);
+                admission::counters().record_event();
+                if let Ok(mut s) = request_log.lock() {
+                    s.record_admission(AdmissionDecision::Reject {
+                        reason: reason.as_str(),
+                        retry_after_secs,
+                    });
+                    s.record_response(429u16, Some("admission_rejected"));
+                }
+                tracing::warn!(
+                    request_id = %request_id,
+                    reason = reason.as_str(),
+                    retry_after_secs,
+                    "Admission control rejected request"
+                );
+                // Note: inflight_guard hasn't been created yet at this
+                // point — we deliberately reject before incrementing
+                // the inflight gauge so rejections don't show as
+                // in-flight requests on the dashboard.
+                let body = Json(ErrorMessage {
+                    message: format!(
+                        "request rejected by admission control (reason={}); retry after {}s",
+                        reason.as_str(),
+                        retry_after_secs
+                    ),
+                    error_type: "rate_limit_exceeded".to_string(),
+                    code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                });
+                let mut response =
+                    (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+                if let Ok(v) = retry_after_secs.to_string().parse() {
+                    response.headers_mut().insert("Retry-After", v);
+                }
+                if let Ok(v) = reason.as_str().parse() {
+                    response
+                        .headers_mut()
+                        .insert("X-Admission-Reject-Reason", v);
+                }
+                return Ok(response);
+            }
+            Err(_) => {
+                // Decision is currently only Admit | Reject — but guard
+                // against future variants by passing through.
+                admission::counters().incr("admit", 1);
+                admission::counters().record_event();
+                None
+            }
+        }
+    } else {
+        admission::counters().incr("admit", 1);
+        admission::counters().record_event();
+        None
+    };
+
     // Create inflight_guard early to ensure all errors (including validation) are counted
     let mut inflight_guard =
         state
@@ -1101,10 +1278,24 @@ async fn chat_completions(
         // EventConverter and monitor_for_disconnects). This is standard SSE behavior.
         stream_handle.arm(); // allows the system to detect client disconnects and cancel the LLM generation
 
+        // Scope clone moved into the stream closure: the closure
+        // updates per-token fields (ISL/OSL/route/cached_tokens/
+        // first_token_at) on each LLMMetricAnnotation, then drops its
+        // clone when the stream finishes. The function-side clone is
+        // used below to mark status=200 once the response stream is
+        // handed off to the client (any later error reaches the
+        // client as an SSE `event: error` event, not as an HTTP
+        // status change).
         let mut http_queue_guard = Some(http_queue_guard);
+        let scope_for_stream = request_log.clone();
         let stream = stream
             .map(move |response| {
-                // Calls observe_response() on each token
+                use crate::preprocessor::LLMMetricAnnotation;
+                // Update per-request log first so we can read
+                // is_first_token before observe_response flips it.
+                if let Ok(Some(metrics)) = LLMMetricAnnotation::from_annotation(&response) {
+                    update_from_metric_annotation(&scope_for_stream, &metrics);
+                }
                 // EventConverter will detect `event: "error"` and convert to SSE error events
                 process_response_using_event_converter_and_observe_metrics(
                     EventConverter::from(response),
@@ -1117,7 +1308,13 @@ async fn chat_completions(
                 // Transpose Result<Option<T>> -> Option<Result<T>>
                 future::ready(result.transpose())
             });
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(
+            stream,
+            ctx,
+            inflight_guard,
+            admission_guard.take(),
+            stream_handle,
+        );
 
         let mut sse_stream = Sse::new(stream);
 
@@ -1125,7 +1322,19 @@ async fn chat_completions(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        state.record_successful_request();
+        // Streaming response handed off; status=200 by HTTP semantics
+        // (any later error reaches the client as an SSE error event,
+        // not as an HTTP status change). The function-side scope clone
+        // records the status; the closure clone keeps updating
+        // per-token fields until the stream finishes. The structured
+        // event emits when the *last* clone drops — typically
+        // closure-side, after the stream is fully consumed.
+        if let Ok(mut s) = request_log.lock() {
+            s.record_response(200u16, None::<&str>);
+        }
+        // `last_successful_request` is stamped by `RequestLogScope::drop`
+        // once the stream finishes, gated on osl>0 — so empty-body
+        // completions can't keep the e2e health bypass green.
         Ok(sse_stream.into_response())
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
@@ -1139,7 +1348,14 @@ async fn chat_completions(
                 })?;
 
         let mut http_queue_guard = Some(http_queue_guard);
+        // Clone scope into the per-token closure for ISL/OSL/route/
+        // first_token observations.
+        let scope_for_stream = request_log.clone();
         let stream = stream_with_check.inspect(move |response| {
+            use crate::preprocessor::LLMMetricAnnotation;
+            if let Ok(Some(metrics)) = LLMMetricAnnotation::from_annotation(response) {
+                update_from_metric_annotation(&scope_for_stream, &metrics);
+            }
             // Calls observe_response() on each token - drops http_queue_guard on first token
             process_response_and_observe_metrics(
                 response,
@@ -1168,10 +1384,17 @@ async fn chat_completions(
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
         // assembled but never delivered. Override to cancelled.
-        if ctx.is_killed() {
-            inflight_guard.mark_error(ErrorType::Cancelled);
+        if let Ok(mut s) = request_log.lock() {
+            if ctx.is_killed() {
+                inflight_guard.mark_error(ErrorType::Cancelled);
+                s.record_response(499u16, Some("client_disconnect"));
+            } else {
+                s.record_response(200u16, None::<&str>);
+            }
         }
-        state.record_successful_request();
+        // `last_successful_request` is stamped by `RequestLogScope::drop`
+        // after the response is fully built, gated on status=200 + osl>0
+        // — client-disconnect (499) and empty-body 200s both stay off.
         Ok(Json(response).into_response())
     }
 }
@@ -1516,7 +1739,7 @@ async fn responses(
 
         // Wrap with disconnect monitoring: detects client disconnects, cancels generation,
         // and defers inflight_guard.mark_ok() until the stream completes.
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, None, stream_handle);
 
         let mut sse_stream = Sse::new(stream);
         if let Some(keep_alive) = state.sse_keep_alive() {
@@ -2130,6 +2353,7 @@ mod tests {
             request_id: None,
             rid: None,
             media_io_kwargs: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         }
     }
@@ -2312,6 +2536,7 @@ mod tests {
             request_id: None,
             rid: None,
             media_io_kwargs: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -2346,6 +2571,7 @@ mod tests {
             request_id: None,
             rid: None,
             media_io_kwargs: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -2383,6 +2609,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
 
@@ -2407,6 +2634,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2430,6 +2658,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2453,6 +2682,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2478,6 +2708,7 @@ mod tests {
                 .unwrap(),
             nvext: None,
             metadata: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2501,6 +2732,7 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2532,6 +2764,7 @@ mod tests {
                 "session": {"id": "session-1", "timestamp": 1640995200}
             })
             .into(),
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
 
@@ -2564,6 +2797,7 @@ mod tests {
             request_id: None,
             rid: None,
             media_io_kwargs: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
 
@@ -2596,6 +2830,7 @@ mod tests {
             request_id: None,
             rid: None,
             media_io_kwargs: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2627,6 +2862,7 @@ mod tests {
             request_id: None,
             rid: None,
             media_io_kwargs: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2658,6 +2894,7 @@ mod tests {
             request_id: None,
             rid: None,
             media_io_kwargs: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2691,6 +2928,7 @@ mod tests {
             request_id: None,
             rid: None,
             media_io_kwargs: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2722,6 +2960,7 @@ mod tests {
             request_id: None,
             rid: None,
             media_io_kwargs: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);

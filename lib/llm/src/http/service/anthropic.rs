@@ -282,7 +282,7 @@ async fn anthropic_messages(
         let full_stream = start_stream.chain(event_stream).chain(done_stream);
         let full_stream = full_stream.map(|result| result.map_err(axum::Error::new));
 
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, None, stream_handle);
 
         let mut sse_stream = Sse::new(stream);
         if let Some(keep_alive) = state.sse_keep_alive() {

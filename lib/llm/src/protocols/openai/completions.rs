@@ -39,9 +39,52 @@ pub struct NvCreateCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 
+    /// Multimodal data (images / videos / audio) carried alongside the
+    /// pre-tokenized prompt. Lands at top level of the JSON request the
+    /// Python `dynamo.trtllm` worker receives — see
+    /// `components/src/dynamo/trtllm/multimodal_processor.py`: it looks
+    /// for `multi_modal_data["image_url"]`, threads through
+    /// `image_loader.load_image_batch`, decodes to PIL, and hands
+    /// `multi_modal_data["image"]` to TRT-LLM's input processor which
+    /// runs the vision encoder.
+    ///
+    /// Populated by the SMG-fronted gRPC TrtllmService when the incoming
+    /// proto's `multimodal_input.image_data` is non-empty
+    /// (`lib/llm/src/grpc/service/trtllm.rs::proto_to_completion_request`).
+    /// Image bytes get base64-encoded into `data:image/...;base64,...`
+    /// URIs which the Python image_loader supports natively. None for
+    /// text-only requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_modal_data: Option<MultiModalData>,
+
     /// Catch-all for unsupported fields - checked during validation
     #[serde(flatten, default, skip_serializing)]
     pub unsupported_fields: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Multimodal data envelope shared between dynamo's Rust frontend and the
+/// Python TRT-LLM worker. Shape matches what the worker's PD-flow path
+/// already consumes: `{"image_url": [{"Url": "<...>"}, ...]}`.
+#[derive(ToSchema, Serialize, Deserialize, Debug, Clone, Default)]
+pub struct MultiModalData {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_url: Vec<MultiModalImageItem>,
+}
+
+/// Per-image item. Serializes externally-tagged so the `Url` variant
+/// becomes `{"Url": "<string>"}` — matches the Python worker's
+/// `URL_VARIANT_KEY = "Url"` lookup in
+/// `components/src/dynamo/common/multimodal/image_loader.py`.
+///
+/// For SMG-Dynamo PD: SMG sends raw image bytes in the gRPC
+/// `MultimodalInput.image_data` field; the Rust handler base64-encodes
+/// them into `data:image/...;base64,...` URIs and emits them under `Url`.
+/// The Python loader supports the `data:` scheme natively (lines 61-74
+/// of image_loader.py).
+#[derive(ToSchema, Serialize, Deserialize, Debug, Clone)]
+pub enum MultiModalImageItem {
+    /// URL (http://, https://, or data:image/...;base64,...).
+    Url(String),
 }
 
 #[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
@@ -228,6 +271,10 @@ impl CommonExtProvider for NvCreateCompletionRequest {
         self.common.skip_special_tokens
     }
 
+    fn get_skip_detokenization(&self) -> Option<bool> {
+        self.common.skip_detokenization
+    }
+
     fn get_dynamic_sampling(&self) -> Option<crate::protocols::common::DynamicSamplingOption> {
         self.common.dynamic_sampling.clone()
     }
@@ -353,6 +400,11 @@ impl TryFrom<NvCreateCompletionRequest> for common::CompletionRequest {
             system_prompt: None,
         });
 
+        // Forward per-message hashes from CommonExt onto the preprocessed
+        // request so the Python worker can read them and pass into the TRT
+        // engine. See `common_ext::MessageHashEntry` for format.
+        let message_hashes = request.common.message_hashes;
+
         Ok(common::CompletionRequest {
             prompt,
             stop_conditions,
@@ -360,6 +412,7 @@ impl TryFrom<NvCreateCompletionRequest> for common::CompletionRequest {
             output_options,
             mdc_sum: None,
             annotations: None,
+            message_hashes,
         })
     }
 }
@@ -412,6 +465,10 @@ impl OpenAIOutputOptionsProvider for NvCreateCompletionRequest {
 
     fn get_skip_special_tokens(&self) -> Option<bool> {
         CommonExtProvider::get_skip_special_tokens(self)
+    }
+
+    fn get_skip_detokenization(&self) -> Option<bool> {
+        CommonExtProvider::get_skip_detokenization(self)
     }
 
     fn get_formatted_prompt(&self) -> Option<bool> {
@@ -509,6 +566,47 @@ mod tests {
                 .expect("Failed to extract output options");
 
             assert_eq!(output_options.skip_special_tokens, Some(skip_value));
+        }
+    }
+
+    #[test]
+    fn test_skip_detokenization_none() {
+        let json_str = json!({
+            "model": "test-model",
+            "prompt": "Hello, world!",
+        });
+
+        let request: NvCreateCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+
+        assert_eq!(request.common.skip_detokenization, None);
+
+        let output_options = request
+            .extract_output_options()
+            .expect("Failed to extract output options");
+
+        assert_eq!(output_options.skip_detokenization, None);
+    }
+
+    #[test]
+    fn test_skip_detokenization_propagates() {
+        for skip_value in [true, false] {
+            let json_str = json!({
+                "model": "test-model",
+                "prompt": "Hello, world!",
+                "skip_detokenization": skip_value
+            });
+
+            let request: NvCreateCompletionRequest =
+                serde_json::from_value(json_str).expect("Failed to deserialize request");
+
+            assert_eq!(request.common.skip_detokenization, Some(skip_value));
+
+            let output_options = request
+                .extract_output_options()
+                .expect("Failed to extract output options");
+
+            assert_eq!(output_options.skip_detokenization, Some(skip_value));
         }
     }
 

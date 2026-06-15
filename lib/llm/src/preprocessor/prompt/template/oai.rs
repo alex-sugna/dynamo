@@ -335,6 +335,19 @@ impl OAIChatLikeRequest for NvCreateCompletionRequest {
             _ => None,
         }
     }
+
+    /// Surface multimodal data that the gRPC handler pre-populated. SMG
+    /// packs raw image bytes into `MultimodalInput.image_data` and
+    /// `proto_to_completion_request` wraps each as `data:image/jpeg;base64,...`
+    /// in `self.multi_modal_data.image_url`. Without this, the preprocessor's
+    /// `gather_multi_modal_data` falls back to scanning `typed_messages()`
+    /// which is None for completions — so the field would never reach the
+    /// Python worker even though it's set on the request.
+    fn preexisting_multi_modal_data(
+        &self,
+    ) -> Option<&crate::protocols::openai::completions::MultiModalData> {
+        self.multi_modal_data.as_ref()
+    }
 }
 
 impl OAIPromptFormatter for HfTokenizerConfigJsonFormatter {

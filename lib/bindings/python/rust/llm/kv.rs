@@ -920,6 +920,7 @@ impl KvRouter {
                     lora_name,
                     0.0,
                     None, // allowed_worker_ids: pass via RoutingHints in PreprocessedRequest path
+                    None, // partition_group: pass via RoutingHints in PreprocessedRequest path
                 )
                 .await
                 .map_err(to_pyerr)?;

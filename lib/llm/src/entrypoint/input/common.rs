@@ -280,7 +280,13 @@ where
             threshold_value,
             monitor_arc,
         )
-        .await?;
+        .await?
+        // For disaggregated PD, this router is the decode-bound push (after
+        // prefill_op hands off). For aggregated, it's the only worker push.
+        // Either way, this is the "decode" half of the prefill/decode split,
+        // and the env var DYN_STREAM_STALL_TIMEOUT_MS_DECODE tunes its stall
+        // detector independent of the prefill router's.
+        .with_stall_timeout_for("decode");
 
     // Eagerly register router request metrics so they appear as zeros even in
     // non-KV modes (Direct, Random, RoundRobin) where KvPushRouter is never created.

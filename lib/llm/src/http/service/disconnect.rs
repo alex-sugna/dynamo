@@ -168,6 +168,7 @@ pub fn monitor_for_disconnects(
     stream: impl Stream<Item = Result<Event, axum::Error>>,
     context: Arc<dyn AsyncEngineContext>,
     mut inflight_guard: InflightGuard,
+    admission_guard: Option<crate::admission::InflightAdmissionGuard>,
     mut stream_handle: ConnectionHandle,
 ) -> impl Stream<Item = Result<Event, axum::Error>> {
     stream_handle.arm();
@@ -178,6 +179,12 @@ pub fn monitor_for_disconnects(
     inflight_guard.mark_error(ErrorType::Cancelled);
 
     async_stream::try_stream! {
+        // [together] Hold the admission inflight guard for the full SSE stream
+        // lifetime so the admission counter decrements at stream-end (decode
+        // finished), not at HTTP-headers-sent. Without this, the counter
+        // undercounts active decode load by the duration of every streaming
+        // response, defeating the per-decode-batch rate limit.
+        let _admission_guard = admission_guard;
         tokio::pin!(stream);
         loop {
             tokio::select! {

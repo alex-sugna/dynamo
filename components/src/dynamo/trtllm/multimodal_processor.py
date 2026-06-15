@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
+import os
 import time
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +24,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import torch
+from tensorrt_llm.inputs.utils import async_load_image
 from tensorrt_llm.llmapi.tokenizer import tokenizer_factory
 
 from dynamo.common.multimodal.image_loader import ImageLoader
@@ -44,6 +47,8 @@ class TokenizerProtocol(Protocol):
 
 class MultimodalRequestProcessor:
     """Simple processor for OpenAI format multimodal requests."""
+
+    _VALID_MM_HANDOFF_MODES = {"prompt", "token_ids"}
 
     def __init__(
         self,
@@ -69,6 +74,15 @@ class MultimodalRequestProcessor:
             self.tokenizer = tokenizer_factory(model_dir)
 
         self.image_loader = ImageLoader()
+        self.mm_handoff_mode = os.environ.get(
+            "DYNAMO_TRTLLM_MM_HANDOFF_MODE", "token_ids"
+        ).lower()
+        if self.mm_handoff_mode not in self._VALID_MM_HANDOFF_MODES:
+            logging.warning(
+                "Invalid DYNAMO_TRTLLM_MM_HANDOFF_MODE=%s; using token_ids",
+                self.mm_handoff_mode,
+            )
+            self.mm_handoff_mode = "token_ids"
 
     def is_url(self, path: str) -> bool:
         """Check if a path is a URL."""
@@ -191,6 +205,37 @@ class MultimodalRequestProcessor:
         """
         self.previous_decoded_text = ""
 
+        # DIAG: log presence + shape of multi_modal_data so we can tell whether
+        # the Rust frontend forwarded SMG's multimodal_input.image_data (the
+        # PD-flow path) before any further processing.
+        _mm = request.get("multi_modal_data")
+        if _mm is None:
+            logging.debug(
+                "MM-DIAG: no multi_modal_data on request; request keys=%s",
+                sorted(list(request.keys())),
+            )
+        else:
+            _img = _mm.get("image_url") if isinstance(_mm, dict) else None
+            _img_count = len(_img) if isinstance(_img, list) else 0
+            _first_kind = None
+            _first_url_prefix = None
+            if _img_count > 0:
+                _first = _img[0]
+                if isinstance(_first, dict):
+                    _first_kind = next(iter(_first.keys()), None)
+                    _v = _first.get(_first_kind) if _first_kind else None
+                    if isinstance(_v, str):
+                        _first_url_prefix = _v[:64]
+                elif isinstance(_first, str):
+                    _first_kind = "str"
+                    _first_url_prefix = _first[:64]
+            logging.debug(
+                "MM-DIAG: multi_modal_data present; image_url items=%d first_kind=%s first_prefix=%s",
+                _img_count,
+                _first_kind,
+                _first_url_prefix,
+            )
+
         # EPD Flow Case 1: Encoder has fully processed the prompt
         # The encode worker has done everything: vision encoding, prompt processing, tokenization
         # Return the encoder's processed prompt and tokens directly
@@ -214,6 +259,15 @@ class MultimodalRequestProcessor:
         # are not processed correctly.
         extra_args = request.get("extra_args") or {}
         formatted_prompt_from_frontend = extra_args.get("formatted_prompt")
+
+        def _decode_prompt_from_token_ids() -> Optional[str]:
+            token_ids = request.get("token_ids")
+            if not token_ids:
+                return None
+            if self.tokenizer is None:
+                logging.warning("No tokenizer available to decode multimodal prompt")
+                return None
+            return self.tokenizer.decode(token_ids, skip_special_tokens=False)
 
         # EPD Flow Case 2: Embeddings received via NIXL from encode worker
         # The encode worker computed vision embeddings and transferred them via RDMA/NIXL
@@ -278,17 +332,34 @@ class MultimodalRequestProcessor:
                             item if isinstance(item, dict) else {"Url": item}
                         )
 
-                # Load regular images as PIL Images for TRT-LLM's input processor
-                # TRT-LLM will auto-detect this and compute mrope_config
+                # Decode images using TRT-LLM's own loader so every PIL-supported
+                # format (incl. GIF) is accepted. NOTE: TRT-LLM's loader calls a bare
+                # PIL Image.open() with no format allowlist, so the Dynamo-side
+                # JPEG/PNG/WEBP restriction (GHSA-cfh3-3jmp-rvhc) intentionally no
+                # longer applies on the URL path. NIXL "Decoded" items (EPD / frontend
+                # decoding) still go through Dynamo's loader. TRT-LLM auto-detects the
+                # resulting PIL images and computes mrope_config.
                 if image_urls:
                     try:
-                        pil_images = await self.image_loader.load_image_batch(
-                            image_urls
+
+                        async def _load_one(item: Any) -> Any:
+                            if isinstance(item, dict) and "Url" in item:
+                                return await async_load_image(
+                                    item["Url"], format="pil"
+                                )
+                            # Non-URL variants (e.g. NIXL "Decoded") keep Dynamo's path.
+                            loaded = await self.image_loader.load_image_batch([item])
+                            return loaded[0]
+
+                        pil_images = list(
+                            await asyncio.gather(
+                                *(_load_one(item) for item in image_urls)
+                            )
                         )
                         if pil_images:
                             processed_mm_data["image"] = pil_images
-                            logging.info(
-                                f"Loaded {len(pil_images)} image(s) as PIL Images"
+                            logging.debug(
+                                f"Loaded {len(pil_images)} image(s) via TRT-LLM loader"
                             )
                     except Exception as e:
                         logging.error(f"Failed to load images: {e}")
@@ -328,6 +399,24 @@ class MultimodalRequestProcessor:
 
             if processed_mm_data:
                 processed_inputs["multi_modal_data"] = processed_mm_data
+                if self.mm_handoff_mode == "prompt":
+                    prompt = (
+                        formatted_prompt_from_frontend
+                        or _decode_prompt_from_token_ids()
+                    )
+                    if prompt is None:
+                        logging.warning(
+                            "No prompt available for multimodal image request"
+                        )
+                        return None
+                    processed_inputs["prompt"] = prompt
+                    logging.debug(
+                        "MM-DIAG: returning prompt + multi_modal_data for TRT-LLM image processing"
+                    )
+                    return processed_inputs
+                logging.debug(
+                    "MM-DIAG: returning prompt_token_ids + multi_modal_data for TRT-LLM image processing"
+                )
 
         # Get token_ids from request (already tokenized by Rust frontend)
         token_ids = request.get("token_ids")

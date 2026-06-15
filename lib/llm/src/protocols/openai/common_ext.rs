@@ -84,11 +84,44 @@ pub struct CommonExt {
     #[builder(default, setter(strip_option))]
     pub skip_special_tokens: Option<bool>,
 
+    /// If true, the Backend operator skips per-token detokenization (and
+    /// the stop-string matching that depends on it). The response stream
+    /// carries raw `token_ids` only; `text` stays empty and stop-string
+    /// boundaries are NOT enforced engine-side.
+    ///
+    /// Set by the SMG-fronting gRPC servicer (lib/llm/src/grpc/service/
+    /// trtllm.rs) on every request, since SMG owns detokenization, stop
+    /// matching, and tool-call parsing on its side. Without this we run
+    /// HF's `decode_stream.step()` per token in Dynamo AND again in SMG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub skip_detokenization: Option<bool>,
+
     /// Dynamic sampling configuration that changes sampling parameters
     /// when a trigger string is encountered during generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub dynamic_sampling: Option<DynamicSamplingOption>,
+
+    /// Per-message content hashes attached by SMG (via `--enable-message-hash`)
+    /// for offline session reconstruction. Each entry is `{role, hash}` where
+    /// hash is the first 12 hex chars of sha256(role + "\x00" + content) —
+    /// matches the SMG-side format and TRT's
+    /// `RequestStatistics.message_hashes` field. Forwarded to the engine
+    /// without interpretation; surfaces in the TRT `statistics={...}` log
+    /// line when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub message_hashes: Option<Vec<MessageHashEntry>>,
+}
+
+/// One per-message hash entry. Mirrors the proto `MessageHash { role, hash }`
+/// at `lib/llm/src/grpc/protos/trtllm_service.proto:166` and TRT-LLM's
+/// `RequestStatistics.message_hashes` `list[dict[str, str]]` shape.
+#[derive(ToSchema, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MessageHashEntry {
+    pub role: String,
+    pub hash: String,
 }
 
 impl CommonExt {
@@ -119,6 +152,7 @@ pub trait CommonExtProvider {
 
     /// Output Options
     fn get_skip_special_tokens(&self) -> Option<bool>;
+    fn get_skip_detokenization(&self) -> Option<bool>;
 
     /// Dynamic Sampling Options
     fn get_dynamic_sampling(&self) -> Option<DynamicSamplingOption>;
@@ -217,6 +251,7 @@ mod tests {
             guided_decoding_backend: None,
             guided_whitespace_pattern: None,
             skip_special_tokens: None,
+            skip_detokenization: None,
             dynamic_sampling: None,
         };
         assert!(common_ext.validate().is_ok());

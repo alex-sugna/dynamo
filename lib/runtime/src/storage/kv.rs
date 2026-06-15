@@ -326,41 +326,52 @@ impl Manager {
         let bucket_name = bucket_name.to_string();
         let (tx, rx) = tokio::sync::mpsc::channel(1024);
         let watch_task = tokio::spawn(async move {
-            // Start listening for changes but don't poll this yet
-            let bucket = self
-                .0
-                .get_or_create_bucket(&bucket_name, bucket_ttl)
-                .await?;
-            let mut stream = bucket.watch().await?;
-
-            // Send all the existing keys
-            for (key, bytes) in bucket.entries().await? {
-                if let Err(err) = tx
-                    .send_timeout(
-                        WatchEvent::Put(KeyValue::new(key, bytes)),
-                        WATCH_SEND_TIMEOUT,
-                    )
-                    .await
-                {
-                    tracing::error!(bucket_name, %err, "KeyValueStoreManager.watch failed adding existing key to channel");
-                }
-            }
-
-            // Now block waiting for new entries
+            // [together] Outer reconnect loop. Underlying watch stream
+            // (etcd kv_watch_prefix etc.) can end silently on compaction
+            // or transport loss; without reconnecting, consumers freeze
+            // until the process restarts (observed: frontend doesn't see
+            // prefill workers restarted by k8s). On reconnect we replay
+            // current entries — consumers are already idempotent on Puts
+            // (the fresh-start path does the same thing).
             loop {
-                let event = tokio::select! {
-                    _ = cancel_token.cancelled() => break,
-                    result = stream.next() => match result {
-                        Some(event) => event,
-                        None => break,
-                    }
-                };
-                if let Err(err) = tx.send_timeout(event, WATCH_SEND_TIMEOUT).await {
-                    tracing::error!(bucket_name, %err, "KeyValueStoreManager.watch failed adding new key to channel");
-                }
-            }
+                let bucket = self
+                    .0
+                    .get_or_create_bucket(&bucket_name, bucket_ttl)
+                    .await?;
+                let mut stream = bucket.watch().await?;
 
-            Ok::<(), StoreError>(())
+                for (key, bytes) in bucket.entries().await? {
+                    if tx
+                        .send_timeout(
+                            WatchEvent::Put(KeyValue::new(key, bytes)),
+                            WATCH_SEND_TIMEOUT,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return Ok::<(), StoreError>(());
+                    }
+                }
+
+                loop {
+                    let event = tokio::select! {
+                        _ = cancel_token.cancelled() => return Ok(()),
+                        result = stream.next() => match result {
+                            Some(event) => event,
+                            None => break,
+                        }
+                    };
+                    if tx.send_timeout(event, WATCH_SEND_TIMEOUT).await.is_err() {
+                        return Ok(());
+                    }
+                }
+
+                tracing::warn!(
+                    bucket_name,
+                    "watch stream ended; reconnecting in 1s"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         });
         (watch_task, rx)
     }

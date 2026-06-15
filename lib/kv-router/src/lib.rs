@@ -37,4 +37,4 @@ pub use protocols::{
     compute_block_hash_for_seq,
 };
 pub use radix_tree::RadixTree;
-pub use sequence::{ActiveSequences, RequestId};
+pub use sequence::{ActiveSequences, RequestId, WorkerLoadSnapshot};

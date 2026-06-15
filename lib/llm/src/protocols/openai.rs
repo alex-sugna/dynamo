@@ -87,6 +87,8 @@ trait OpenAIOutputOptionsProvider {
 
     fn get_skip_special_tokens(&self) -> Option<bool>;
 
+    fn get_skip_detokenization(&self) -> Option<bool>;
+
     fn get_formatted_prompt(&self) -> Option<bool>;
 }
 
@@ -203,12 +205,14 @@ impl<T: OpenAIOutputOptionsProvider> OutputOptionsProvider for T {
         let logprobs = self.get_logprobs();
         let prompt_logprobs = self.get_prompt_logprobs();
         let skip_special_tokens = self.get_skip_special_tokens();
+        let skip_detokenization = self.get_skip_detokenization();
         let formatted_prompt = self.get_formatted_prompt();
 
         Ok(common::OutputOptions {
             logprobs,
             prompt_logprobs,
             skip_special_tokens,
+            skip_detokenization,
             formatted_prompt,
         })
     }

@@ -3,8 +3,22 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+
+/// [PD_TIMING] Wall-clock seconds since the Unix epoch as f64.
+/// Cross-pod log correlation: pair with the float timestamps logged by the
+/// Python handler (handler_base.py) and the request statistics line emitted by
+/// the TRT-LLM engine. Returns 0.0 on the (practically impossible) case of
+/// the system clock being before UNIX_EPOCH.
+#[inline]
+fn pd_now_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
 use futures::{
     StreamExt,
     stream::{self},
@@ -24,9 +38,10 @@ use dynamo_runtime::{
 };
 
 use crate::{
-    discovery::ModelManager,
+    discovery::{ModelManager, RuntimeConfigWatch},
     kv_router::protocols::WorkerId,
     kv_router::{KvPushRouter, KvRouterConfig, RouterConfigOverride, protocols::BlockExtraInfo},
+    protocols::common::FinishReason,
     protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest},
     protocols::common::preprocessor::{BootstrapInfo, PrefillResult},
     protocols::common::timing::{RequestPhase, RequestTracker, WORKER_TYPE_PREFILL},
@@ -67,6 +82,27 @@ enum PrefillOutcome {
     Completed {
         result: PrefillResult,
         first_client_delta: Option<Annotated<LLMEngineOutput>>,
+    },
+    /// Prefill terminated the request itself (EOS / stop word on the first
+    /// generated token). TRT-LLM emits no disaggregated_params and queues no
+    /// KV transfer in this case — the response is already complete and
+    /// decode is not needed. Forward the accumulated prefill outputs back to
+    /// the client.
+    TerminalInPrefill {
+        outputs: Vec<Annotated<LLMEngineOutput>>,
+    },
+}
+
+/// Result of `execute_prefill`: either a normal prefill (decode required) or
+/// a terminal prefill (decode skipped).
+enum ExecutePrefillResult {
+    Normal {
+        result: PrefillResult,
+        first_client_delta: Option<Annotated<LLMEngineOutput>>,
+        worker_info: Option<(u64, u32)>,
+    },
+    Terminal {
+        outputs: Vec<Annotated<LLMEngineOutput>>,
     },
 }
 
@@ -128,6 +164,18 @@ pub struct PrefillRouter {
     model_name: String,
     /// Namespace used to look up the correct WorkerSet's worker monitor
     namespace: String,
+    /// Watcher for the prefill endpoint's per-worker ModelRuntimeConfig. Used to
+    /// look up the picked prefill's partition_group on the decode handoff so the
+    /// decode scheduler can restrict to the same partition. None until activate().
+    prefill_runtime_config_watch: OnceLock<RuntimeConfigWatch>,
+    /// Watcher for the decode endpoint's per-worker ModelRuntimeConfig. Used to
+    /// compute the set of partition_groups that currently have at least one
+    /// live decode worker, so we can exclude prefill workers whose partition
+    /// has no surviving decodes from selection (fail-fast at prefill pick
+    /// instead of burning prefill compute on a doomed pipeline). Populated at
+    /// construction by the discovery layer; None for `disabled()` (no decode
+    /// endpoint to track).
+    decode_runtime_config_watch: Option<RuntimeConfigWatch>,
 }
 
 impl PrefillRouter {
@@ -179,6 +227,8 @@ impl PrefillRouter {
             decode_fallback,
             model_name: String::new(), // Not used for disabled router
             namespace: String::new(),  // Not used for disabled router
+            prefill_runtime_config_watch: OnceLock::new(),
+            decode_runtime_config_watch: None,
         })
     }
 
@@ -192,6 +242,7 @@ impl PrefillRouter {
         decode_fallback: bool,
         model_name: String,
         namespace: String,
+        decode_runtime_config_watch: Option<RuntimeConfigWatch>,
     ) -> Arc<Self> {
         let prefill_router = OnceLock::new();
         let cancel_token = CancellationToken::new();
@@ -205,6 +256,8 @@ impl PrefillRouter {
             decode_fallback,
             model_name,
             namespace,
+            prefill_runtime_config_watch: OnceLock::new(),
+            decode_runtime_config_watch,
         });
 
         // Spawn background task to wait for activation
@@ -251,11 +304,15 @@ impl PrefillRouter {
         // Store endpoint_id for later use in resolve_prefill_worker
         let _ = self.endpoint_id.set(endpoint.id());
 
-        // Start runtime config watcher for this endpoint (needed for get_disaggregated_endpoint)
-        // This must be done before creating the router so bootstrap info is available
-        model_manager
+        // Start runtime config watcher for this endpoint (needed for get_disaggregated_endpoint
+        // AND for the partition_group lookup at the decode handoff).
+        // This must be done before creating the router so bootstrap info is available.
+        let prefill_runtime_config_watch = model_manager
             .get_or_create_runtime_config_watcher(&endpoint)
             .await?;
+        let _ = self
+            .prefill_runtime_config_watch
+            .set(prefill_runtime_config_watch);
 
         let inner_router = if self.router_mode.is_kv_routing() {
             // Create KV chooser using the endpoint (this is a prefill router)
@@ -285,7 +342,11 @@ impl PrefillRouter {
                 None, // busy_threshold
                 None, // worker_monitor
             )
-            .await?;
+            .await?
+            // Opt in to the prefill-side stall timeout knob
+            // (DYN_STREAM_STALL_TIMEOUT_MS_PREFILL). Falls back to the base
+            // DYN_STREAM_STALL_TIMEOUT_MS read by the constructor when unset.
+            .with_stall_timeout_for("prefill");
 
             // Wrap it in KvPushRouter
             InnerPrefillRouter::KvRouter(Arc::new(KvPushRouter::new(push_router, kv_chooser)))
@@ -309,7 +370,11 @@ impl PrefillRouter {
                 None, // busy_threshold
                 None, // worker_monitor
             )
-            .await?;
+            .await?
+            // Same prefill-side stall timeout override as the KV-mode branch
+            // above. The decode push (built in entrypoint/input/common.rs)
+            // gets the "decode" override.
+            .with_stall_timeout_for("prefill");
 
             InnerPrefillRouter::SimpleRouter(Arc::new(push_router))
         };
@@ -413,27 +478,36 @@ impl PrefillRouter {
     /// allowing subsequent `set_phase` calls to proceed. This is used in the bootstrap
     /// optimization path to ensure `record_worker_full` completes before the phase changes.
     ///
-    /// Returns (PrefillResult, Option<first_client_delta>, Option<(worker_id, dp_rank)>).
+    /// Returns either a normal prefill result (decode required) or a terminal
+    /// prefill result (decode skipped — prefill emitted EOS / stop word on the
+    /// first generated token, so TRT-LLM did not queue a KV transfer).
     async fn execute_prefill(
         router: Option<InnerPrefillRouter>,
         request: SingleIn<PreprocessedRequest>,
         target_worker: Option<u64>,
         phase_permit: Option<OwnedSemaphorePermit>,
-    ) -> Result<
-        (
-            PrefillResult,
-            Option<Annotated<LLMEngineOutput>>,
-            Option<(u64, u32)>,
-        ),
-        PrefillError,
-    > {
+        request_id: &str,
+    ) -> Result<ExecutePrefillResult, PrefillError> {
         let router = router.ok_or(PrefillError::NotActivated)?;
         let mut prefill_response = router
             .generate_to_worker(request, target_worker)
             .await
             .map_err(|e| {
+                // Embed the source error chain in the outer message so
+                // grpc/service/openai.rs::classify_setup_error can match
+                // the `KvSchedulerError::AdmissionRejected` Display text
+                // ("admission control rejected request (retry after Ns)")
+                // via substring fallback when typed downcast can't see
+                // through the `anyhow → Box<dyn Error>` wrapping that
+                // `Some(e.into())` produces. Companion to the typed
+                // downcast in classify_setup_error — typed first, this
+                // substring is the safety net. Mirrors the HTTP path's
+                // belt-and-suspenders approach at http/service/openai.rs
+                // ~line 234. The 400 path (JSON code payload) walks
+                // braces left-to-right so a wrapped message with `{` in
+                // the prefix won't shadow a legitimate 400 payload.
                 PrefillError::PrefillError(
-                    "failed to route to prefill worker".to_string(),
+                    format!("failed to route to prefill worker: {e:#}"),
                     Some(e.into()),
                 )
             })?;
@@ -449,11 +523,43 @@ impl PrefillRouter {
             ));
         };
 
+        // [PD_TIMING] Frontend has the prefill first_output (contains
+        // disaggregated_params + first token). Pair with the prefill pod's
+        // `prefill_handler_yield` log on the same request_id to measure the
+        // prefill-pod→frontend NATS hop. Pair with prefill stats' kv_send_start
+        // to measure the full engine→frontend visibility latency.
+        tracing::info!(
+            "[PD_TIMING] event=frontend_first_output_received context_id={} ts={:.6}",
+            request_id,
+            pd_now_secs(),
+        );
+
         if let Some(err) = first_output.err() {
             return Err(PrefillError::PrefillError(
                 "Prefill router returned error in output".to_string(),
                 Some(Box::new(err)),
             ));
+        }
+
+        // If prefill terminated the request itself (Stop / EoS / Length on the
+        // first generated token) and emitted no disaggregated_params, there is
+        // no KV transfer to coordinate and no work for decode. Collect the
+        // remaining prefill outputs and forward them to the client directly.
+        let terminal_in_prefill = first_output.data.as_ref().is_some_and(|o| {
+            o.disaggregated_params.is_none()
+                && matches!(
+                    o.finish_reason,
+                    Some(FinishReason::Stop)
+                        | Some(FinishReason::EoS)
+                        | Some(FinishReason::Length)
+                )
+        });
+        if terminal_in_prefill {
+            let mut outputs = vec![first_output];
+            while let Some(next) = prefill_response.next().await {
+                outputs.push(next);
+            }
+            return Ok(ExecutePrefillResult::Terminal { outputs });
         }
 
         let mut prompt_tokens_details = first_output
@@ -472,6 +578,18 @@ impl PrefillRouter {
                     .and_then(|u| u.prompt_tokens_details.clone());
             }
         }
+
+        // [PD_TIMING] Prefill response stream from the prefill pod has closed.
+        // In healthy disagg this is microseconds after first_output (TRT-LLM
+        // iterator ends right after the single yield). When kv-transfer hangs,
+        // this is delayed until the prefill engine's kv_transfer_timeout fires
+        // and the request is fully torn down. The delta to
+        // `frontend_first_output_received` is the drain-wait cost.
+        tracing::info!(
+            "[PD_TIMING] event=frontend_prefill_stream_closed context_id={} ts={:.6}",
+            request_id,
+            pd_now_secs(),
+        );
 
         let Some(output) = &first_output.data else {
             return Err(PrefillError::NoDisaggregatedParams(
@@ -509,15 +627,15 @@ impl PrefillRouter {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
 
-        Ok((
-            PrefillResult {
+        Ok(ExecutePrefillResult::Normal {
+            result: PrefillResult {
                 disaggregated_params,
                 prompt_tokens_details,
                 cached_tokens,
             },
             first_client_delta,
-            prefill_worker_info,
-        ))
+            worker_info: prefill_worker_info,
+        })
     }
 
     /// Spawn prefill as a background task.
@@ -531,6 +649,7 @@ impl PrefillRouter {
         prefill_request: SingleIn<PreprocessedRequest>,
         target_worker: Option<u64>,
         phase_permit: OwnedSemaphorePermit,
+        request_id: String,
     ) {
         let router = self.prefill_router.get().cloned();
         // Capture current span to propagate trace context to the spawned task
@@ -543,6 +662,7 @@ impl PrefillRouter {
                     prefill_request,
                     target_worker,
                     Some(phase_permit),
+                    &request_id,
                 )
                 .await
                 {
@@ -556,6 +676,87 @@ impl PrefillRouter {
             }
             .instrument(span),
         );
+    }
+
+    /// Compute the set of prefill worker IDs whose `partition_group` has at
+    /// least one live decode worker. If both runtime-config watches are
+    /// populated, returns the intersection of (a) the caller's
+    /// `allowed_worker_ids` (or "all" if None) and (b) prefills whose
+    /// partition has decode coverage. Returns `None` (= no filter, existing
+    /// behavior) when the decode watch isn't available — e.g. aggregated
+    /// mode, the C bindings disabled-router path, or any future code path
+    /// that skips passing the decode watch into `new()`.
+    ///
+    /// Coverage rule mirrors the scheduler's eligibility check:
+    /// - prefill `partition_group = None` ⇒ wildcard, always allowed
+    ///   (stamps a `None` partition on decode_req → scheduler doesn't filter)
+    /// - prefill `partition_group = Some(g)` ⇒ allowed iff some decode has
+    ///   `partition_group = Some(g)` OR some decode has `partition_group =
+    ///   None` (wildcard decode)
+    /// - no decodes at all ⇒ all prefills excluded (request will fail fast
+    ///   with `NoEndpoints`; correct fail mode — no decode means no service)
+    fn compute_allowed_prefills(
+        &self,
+        caller_allowed: Option<HashSet<WorkerId>>,
+    ) -> Option<HashSet<WorkerId>> {
+        let decode_watch = self.decode_runtime_config_watch.as_ref()?;
+        let prefill_watch = self.prefill_runtime_config_watch.get()?;
+
+        // Snapshot decode partitions
+        let decode_snapshot = decode_watch.borrow();
+        let mut live_partitions: HashSet<Option<String>> = HashSet::new();
+        for cfg in decode_snapshot.values() {
+            live_partitions.insert(cfg.partition_group.clone());
+        }
+        let wildcard_decode = live_partitions.contains(&None);
+        drop(decode_snapshot);
+
+        // Snapshot prefill partitions and apply the coverage rule
+        let prefill_snapshot = prefill_watch.borrow();
+        let total_prefills = prefill_snapshot.len();
+        let mut allowed: HashSet<WorkerId> = HashSet::new();
+        let mut excluded_partitions: HashSet<String> = HashSet::new();
+        for (wid, cfg) in prefill_snapshot.iter() {
+            let routable = match &cfg.partition_group {
+                None => true, // wildcard prefill; stamps None
+                Some(g) => wildcard_decode || live_partitions.contains(&Some(g.clone())),
+            };
+            if routable {
+                allowed.insert(*wid);
+            } else if let Some(g) = &cfg.partition_group {
+                excluded_partitions.insert(g.clone());
+            }
+        }
+        drop(prefill_snapshot);
+
+        // Log every call so we can prove at runtime that the filter is running
+        // AND what it currently sees, not just when it's excluding workers. The
+        // earlier "only on exclusion" gate masked the case where the filter ran
+        // but live_partitions still contained a partition whose decode had just
+        // been reported down (watch propagation race) — i.e. the bug it was
+        // supposed to catch was invisible.
+        let excluded_count = total_prefills - allowed.len();
+        let final_allowed_count = match &caller_allowed {
+            Some(caller) => caller.intersection(&allowed).count(),
+            None => allowed.len(),
+        };
+        tracing::info!(
+            live_partitions = ?live_partitions,
+            wildcard_decode,
+            allowed_count = allowed.len(),
+            excluded_count,
+            excluded_partitions = ?excluded_partitions,
+            total_prefills,
+            caller_allowed_count = ?caller_allowed.as_ref().map(|s| s.len()),
+            final_allowed_count,
+            "[partition] compute_allowed_prefills snapshot"
+        );
+
+        // Intersect with caller's allowed set (e.g. EPP or migration retry exclusions)
+        match caller_allowed {
+            Some(caller) => Some(caller.intersection(&allowed).copied().collect()),
+            None => Some(allowed),
+        }
     }
 
     /// Query the best prefill worker without executing a request.
@@ -577,6 +778,11 @@ impl PrefillRouter {
             .get()
             .ok_or_else(|| anyhow::anyhow!(PrefillError::NotActivated))?;
 
+        // Restrict to prefills whose partition has live decodes. When the
+        // decode watch isn't available this returns the caller's set unchanged
+        // (existing behavior preserved for non-disaggregated paths).
+        let effective_allowed = self.compute_allowed_prefills(allowed_worker_ids);
+
         match prefill_router {
             InnerPrefillRouter::KvRouter(r) => {
                 let (worker, _overlap) = r
@@ -589,7 +795,8 @@ impl PrefillRouter {
                         update_states,
                         lora_name,
                         priority_jump,
-                        allowed_worker_ids,
+                        effective_allowed,
+                        None, // partition_group: prefill picks are global; partitioning only constrains decode
                     )
                     .await?;
                 Ok((worker.worker_id, worker.dp_rank))
@@ -638,12 +845,44 @@ impl
         let request_id = context.id().to_string();
         let engine_ctx = context.context();
 
+        // [pin_trace:5/prefill_router_entry] First log inside PrefillRouter.
+        // Confirms the pin survived Migration + Backend operators. If pin is
+        // None here but Migration's [pin_trace:3/migration] showed it Some,
+        // the loss is in the operator chain wiring between Migration→Backend
+        // and PrefillRouter — investigate `link()` / forward_edge plumbing.
+        tracing::info!(
+            target: "dynamo::pin_trace",
+            request_id = %request_id,
+            decode_instance_id = ?req.decode_instance_id,
+            routing_backend_instance_id = ?req.routing.as_ref().and_then(|r| r.backend_instance_id),
+            routing_decode_worker_id = ?req.routing.as_ref().and_then(|r| r.decode_worker_id),
+            tracker_phase = ?req.tracker.as_ref().map(|t| t.phase()),
+            has_tracker = req.tracker.is_some(),
+            prefill_router_activated = self.prefill_router.get().is_some(),
+            "[pin_trace:5/prefill_router_entry] PrefillRouter::generate entry"
+        );
+
         // Save original max_tokens for decode
         let original_max_tokens = req.stop_conditions.max_tokens;
 
         // If prefill router is not activated (no prefill workers discovered),
         // this is aggregated mode — route directly to decode.
+        //
+        // [SMG-DYNAMO DEBUG] Loud log to diagnose smg-dynamo-pd-kimi-mn:
+        // when SMG drives the gRPC servicer in cross-pod PD, every request
+        // hit this branch and decode rejected with "Disaggregated params
+        // are required for decode mode". Logging model_name/namespace +
+        // request_id so we can match against the activator key registered
+        // in watcher.rs:480/725 and confirm whether activation never fired
+        // (cause #1) vs. fired under a different key (cause #2).
         if self.prefill_router.get().is_none() {
+            tracing::warn!(
+                request_id = %request_id,
+                model_name = %self.model_name,
+                namespace = %self.namespace,
+                "PrefillRouter NOT activated; falling through to aggregated path \
+                 (decode worker will see no disaggregated_params)"
+            );
             return next.generate(context.map(|_| req)).await;
         }
 
@@ -667,10 +906,21 @@ impl
 
         // Try to resolve prefill worker upfront: if we can get bootstrap info early,
         // spawn prefill in background and proceed to decode immediately.
+        //
+        // Accept both `prefill_worker_id` (set by upstream routers / EPP) and
+        // `backend_instance_id` (the generic "pin to this worker" field used by
+        // the e2e health-check probe at `system_status_server.rs::handle_health`).
+        // Without honoring `backend_instance_id` here, the partition-liveness
+        // filter below silently redirects the probe to a different prefill,
+        // masking real worker-down conditions: the dead worker returns 200 from
+        // its `/health/prefill` endpoint because dynamo rerouted to a live peer.
+        // KvPushRouter::select_worker already does the same merge (line ~246:
+        // `r.prefill_worker_id.or(r.backend_instance_id)`); mirror it here so
+        // the prefill_router-level filter respects the same targeting contract.
         let preselected_worker = prefill_req
             .routing
             .as_ref()
-            .and_then(|r| r.prefill_worker_id);
+            .and_then(|r| r.prefill_worker_id.or(r.backend_instance_id));
 
         // In Direct routing mode, the prefill_worker_id must come from the request
         // headers (x-prefill-instance-id), set by the external router (e.g., EPP).
@@ -678,6 +928,68 @@ impl
             return Err(anyhow::anyhow!(
                 PrefillError::MissingWorkerIdForDirectRouting
             ));
+        }
+
+        // Diagnostic: log every request that arrives with a caller-set pin
+        // (prefill_worker_id or backend_instance_id). Tells us whether the pin
+        // survived the upstream pipeline (Migration → preprocessor → backend).
+        // For health probes the pin always points at the probe's own worker —
+        // if this log fires for a dead-worker probe but the request still 200s,
+        // the leak is downstream of prefill_router.
+        if let Some(id) = preselected_worker {
+            let via = prefill_req.routing.as_ref().and_then(|r| {
+                if r.prefill_worker_id.is_some() {
+                    Some("routing.prefill_worker_id")
+                } else if r.backend_instance_id.is_some() {
+                    Some("routing.backend_instance_id")
+                } else {
+                    None
+                }
+            });
+            tracing::info!(
+                request_id = %request_id,
+                preselected_id = id,
+                preselected_via = ?via,
+                "[prefill_router] honoring caller pin; partition filter will be skipped"
+            );
+        }
+
+        // Pin the partition-liveness filter onto the request so BOTH pick paths
+        // honor it — the bootstrap optimization path (resolve_prefill_worker ->
+        // query_prefill_worker) AND the fallback path (KvPushRouter::generate
+        // picks internally from routing.allowed_worker_ids). Without this, the
+        // fallback path bypasses the filter and can route to a prefill in a
+        // partition whose decode is dead. Skip when preselected_worker is set —
+        // operator intent (health checks) takes precedence.
+        if preselected_worker.is_none() {
+            if let Some(allowed) = self.compute_allowed_prefills(None) {
+                let routing = prefill_req.routing_mut();
+                let merged: HashSet<WorkerId> = match routing.allowed_worker_ids.take() {
+                    Some(caller) => caller.intersection(&allowed).copied().collect(),
+                    None => allowed,
+                };
+                tracing::info!(
+                    request_id = %context.id(),
+                    allowed_count = merged.len(),
+                    "[partition] prefill_router applied liveness filter to routing.allowed_worker_ids"
+                );
+                routing.allowed_worker_ids = Some(merged);
+            } else {
+                // compute_allowed_prefills returned None — decode_runtime_config_watch
+                // wasn't available (e.g. aggregated mode, C-bindings path). The fallback
+                // path will pick freely; no liveness filtering. Worth surfacing because
+                // an unset watch was a real failure mode during the rollout race.
+                tracing::info!(
+                    request_id = %context.id(),
+                    "[partition] prefill_router SKIPPED liveness filter (decode_runtime_config_watch unavailable)"
+                );
+            }
+        } else {
+            tracing::info!(
+                request_id = %context.id(),
+                preselected = ?preselected_worker,
+                "[partition] prefill_router SKIPPED liveness filter (caller pinned a worker)"
+            );
         }
 
         let prefill_result = async {
@@ -705,12 +1017,24 @@ impl
 
                 // Pass phase permit to spawned task - it drops after first output (record_worker_full complete)
                 // This allows set_phase(Decode) below to proceed only after prefill routing is done
-                self.spawn_prefill_task(prefill_context, Some(worker_id), prefill_phase_permit);
+                self.spawn_prefill_task(
+                    prefill_context,
+                    Some(worker_id),
+                    prefill_phase_permit,
+                    request_id.clone(),
+                );
 
                 Ok(PrefillOutcome::Bootstrap(bootstrap_info))
             } else {
-                // Original prefill path: wait for prefill to complete
-                tracing::debug!("Using original prefill path");
+                // Original prefill path: wait for prefill to complete. Fires when
+                // resolve_prefill_worker returns None (e.g., picked worker has no
+                // bootstrap info yet, or query_prefill_worker errored). KvPushRouter
+                // will pick internally — the filter still applies via the
+                // routing.allowed_worker_ids we pinned above.
+                tracing::info!(
+                    request_id = %request_id,
+                    "[partition] using original prefill path (resolve_prefill_worker returned None)"
+                );
 
                 // Drop the phase permit - we wait for completion
                 // so there's no race with set_phase(Decode) below
@@ -721,18 +1045,39 @@ impl
 
                 // In Direct mode, pass preselected_worker so execute_prefill uses
                 // router.direct() instead of router.generate() (which bails in Direct mode).
-                let (result, first_client_delta, _worker_info) = Self::execute_prefill(
+                let _pd_exec_prefill_result = Self::execute_prefill(
                     self.prefill_router.get().cloned(),
                     prefill_context,
                     preselected_worker,
                     None,
+                    &request_id,
                 )
                 .await?;
 
-                Ok(PrefillOutcome::Completed {
-                    result,
-                    first_client_delta,
-                })
+                // [PD_TIMING] execute_prefill has fully returned. Equivalent to
+                // `frontend_prefill_stream_closed` plus a few μs of result unpacking.
+                // Useful as the start-of-decode-dispatch wall-clock on this side.
+                tracing::info!(
+                    "[PD_TIMING] event=frontend_execute_prefill_returned context_id={} ts={:.6}",
+                    request_id, pd_now_secs(),
+                );
+
+                match _pd_exec_prefill_result {
+                    ExecutePrefillResult::Normal {
+                        result,
+                        first_client_delta,
+                        worker_info,
+                    } => {
+                        let _ = worker_info; // not used; partition stamp reads tracker instead
+                        Ok(PrefillOutcome::Completed {
+                            result,
+                            first_client_delta,
+                        })
+                    }
+                    ExecutePrefillResult::Terminal { outputs } => {
+                        Ok(PrefillOutcome::TerminalInPrefill { outputs })
+                    }
+                }
             }
         }
         .await;
@@ -748,6 +1093,21 @@ impl
 
         // Handle prefill result
         match prefill_result {
+            Ok(PrefillOutcome::TerminalInPrefill { outputs }) => {
+                // Prefill terminated the request itself (EOS / stop word on
+                // the first generated token). No KV transfer was queued and
+                // decode has nothing to do — forward the accumulated prefill
+                // outputs straight back to the client.
+                tracing::debug!(
+                    "Prefill terminated request without decode handoff ({} outputs)",
+                    outputs.len()
+                );
+                if let Some(ref tracker) = req.tracker {
+                    let _decode_permit = tracker.set_phase(RequestPhase::Decode).await;
+                }
+                let stream = stream::iter(outputs);
+                return Ok(ResponseStream::new(Box::pin(stream), engine_ctx));
+            }
             Ok(outcome) => {
                 tracing::debug!("Prefill completed, proceeding to decode");
 
@@ -760,6 +1120,20 @@ impl
                 }
 
                 let mut decode_req = req;
+                // [pin_trace:6/decode_req_built] decode_req is the surviving
+                // copy of the original PreprocessedRequest. Its pin must
+                // still be Some(<target>) here (we only cleared it on the
+                // prefill_req CLONE, not on req). If it's None here but was
+                // Some at [pin_trace:5], something mutated req between
+                // entry and prefill completion — investigate `execute_prefill`
+                // or the bootstrap path.
+                tracing::info!(
+                    target: "dynamo::pin_trace",
+                    request_id = %request_id,
+                    decode_instance_id = ?decode_req.decode_instance_id,
+                    routing_backend_instance_id = ?decode_req.routing.as_ref().and_then(|r| r.backend_instance_id),
+                    "[pin_trace:6/decode_req_built] decode_req = req (post-prefill, pre-decode dispatch)"
+                );
                 let first_client_delta = match outcome {
                     PrefillOutcome::Bootstrap(info) => {
                         decode_req.bootstrap_info = Some(info);
@@ -781,6 +1155,9 @@ impl
                         decode_req.prefill_result = Some(result);
                         first_client_delta
                     }
+                    PrefillOutcome::TerminalInPrefill { .. } => {
+                        unreachable!("TerminalInPrefill handled above")
+                    }
                 };
 
                 // Restore original max_tokens for decode
@@ -798,6 +1175,44 @@ impl
                     r.backend_instance_id = None;
                 }
 
+                // Partitioning (opt-in via DYN_PARTITIONING_ENABLED=1): stamp the picked
+                // prefill's partition_group onto decode_req so the decode scheduler restricts
+                // its pick to workers in the same partition. Defensive: log every condition
+                // path so we can tell from logs which gate is failing if behavior surprises.
+                // Partitioning (opt-in via DYN_PARTITIONING_ENABLED=1): stamp the picked
+                // prefill's partition_group onto decode_req so the decode scheduler restricts
+                // its pick to the same partition. The picked worker_id is recorded on the
+                // RequestTracker by KvPushRouter::generate via record_worker_full — read
+                // it back here.
+                let env_on =
+                    std::env::var("DYN_PARTITIONING_ENABLED").as_deref() == Ok("1");
+                let prefill_wid_opt = decode_req
+                    .tracker
+                    .as_ref()
+                    .and_then(|t| t.prefill_worker_id());
+                if env_on
+                    && let Some(watch) = self.prefill_runtime_config_watch.get()
+                    && let Some(prefill_wid) = prefill_wid_opt
+                {
+                    let group = watch
+                        .borrow()
+                        .get(&prefill_wid)
+                        .and_then(|c| c.partition_group.clone());
+                    tracing::info!(
+                        request_id = %request_id, prefill_worker_id = prefill_wid,
+                        partition_group = ?group,
+                        "[partition] stamping decode_req"
+                    );
+                    if let Some(routing) = decode_req.routing.as_mut() {
+                        routing.partition_group = group;
+                    } else if group.is_some() {
+                        let mut routing =
+                            crate::protocols::common::preprocessor::RoutingHints::default();
+                        routing.partition_group = group;
+                        decode_req.routing = Some(routing);
+                    }
+                }
+
                 // Set router_config_override for decode:
                 // - overlap_score_weight = 0 (no KV cache overlap scoring for decode)
                 // - assume_kv_reuse = false (generate random hashes since decode workers
@@ -809,9 +1224,49 @@ impl
                     ..existing_override.unwrap_or_default()
                 });
 
+                // [pin_trace:7/decode_dispatch] LAST checkpoint inside
+                // PrefillRouter before handing off to KvPushRouter (decode).
+                // After this log, the next code that touches the pin is
+                // [pin_trace:8/kvpushrouter_entry]. If pin survives here but
+                // not there, the loss is in `next.generate()` plumbing or
+                // ServiceBackend / KvPushRouter::generate prelude.
+                tracing::info!(
+                    target: "dynamo::pin_trace",
+                    request_id = %request_id,
+                    decode_pin = ?decode_req.decode_instance_id,
+                    routing_backend_instance_id = ?decode_req.routing.as_ref().and_then(|r| r.backend_instance_id),
+                    routing_decode_worker_id = ?decode_req.routing.as_ref().and_then(|r| r.decode_worker_id),
+                    routing_partition_group = ?decode_req.routing.as_ref().and_then(|r| r.partition_group.clone()),
+                    tracker_phase = ?decode_req.tracker.as_ref().map(|t| t.phase()),
+                    has_tracker = decode_req.tracker.is_some(),
+                    "[pin_trace:7/decode_dispatch] handing decode_req to next.generate (KvPushRouter)"
+                );
+
                 // Map the modified request through with preserved context
                 let decode_request = context.map(|_| decode_req);
+
+                // [PD_TIMING] About to dispatch decode via the decode router
+                // (`next.generate(...)`). This call publishes to NATS and returns
+                // a stream handle; it does NOT wait for the decode worker to
+                // start processing. The delta between this log and
+                // `frontend_decode_stream_obtained` measures dispatch overhead
+                // (route lookup + NATS publish + subscription setup).
+                let pd_decode_dispatch_at = pd_now_secs();
+                tracing::info!(
+                    "[PD_TIMING] event=frontend_decode_dispatch context_id={} ts={:.6}",
+                    request_id, pd_decode_dispatch_at,
+                );
+
                 let decode_stream = next.generate(decode_request).await?;
+
+                let pd_decode_obtained_at = pd_now_secs();
+                tracing::info!(
+                    "[PD_TIMING] event=frontend_decode_stream_obtained context_id={} ts={:.6} dispatch_to_obtained_ms={:.3}",
+                    request_id,
+                    pd_decode_obtained_at,
+                    (pd_decode_obtained_at - pd_decode_dispatch_at) * 1000.0,
+                );
+
                 let response_context = decode_stream.context();
                 let prefill_cached_tokens = match &first_client_delta {
                     Some(delta) => delta.data.as_ref()
@@ -822,9 +1277,21 @@ impl
                     None => None,
                 };
                 let mut first_decode_chunk = true;
+                // Clone request_id into the stream closure for the first-chunk log
+                let pd_request_id_for_decode = request_id.clone();
                 let decode_stream = decode_stream.map(move |mut output| {
                     if first_decode_chunk {
                         first_decode_chunk = false;
+                        // [PD_TIMING] First chunk from the decode worker has
+                        // arrived at the frontend (success or error). The delta
+                        // to `frontend_decode_stream_obtained` measures the time
+                        // from NATS publish until the decode worker actually
+                        // produced (and the frontend received) its first output.
+                        tracing::info!(
+                            "[PD_TIMING] event=frontend_first_decode_chunk context_id={} ts={:.6}",
+                            pd_request_id_for_decode,
+                            pd_now_secs(),
+                        );
                         if let Some(prefill_cached_tokens) = prefill_cached_tokens
                             && let Some(ref mut data) = output.data
                         {
@@ -835,6 +1302,16 @@ impl
                     }
                     output
                 });
+
+                // [PD_TIMING] Frontend is returning the wrapped ResponseStream
+                // to its caller (the gRPC servicer). The first chunk SMG will
+                // see is the prefill_delta, prepended below; subsequent chunks
+                // are decode tokens (logged above on arrival).
+                tracing::info!(
+                    "[PD_TIMING] event=frontend_returning_stream context_id={} ts={:.6}",
+                    request_id, pd_now_secs(),
+                );
+
                 Ok(Self::prepend_prefill_delta(
                     ResponseStream::new(Box::pin(decode_stream), response_context),
                     first_client_delta,
@@ -859,12 +1336,14 @@ impl
             Err(e) => {
                 if !self.decode_fallback {
                     tracing::error!(
+                        request_id = %context.id(),
                         error = %e,
                         "Remote prefill failed and decode fallback is disabled. Failing request."
                     );
                     return Err(anyhow::anyhow!(e));
                 }
                 tracing::warn!(
+                    request_id = %context.id(),
                     error = %e,
                     "Remote prefill failed, falling back to decode-only. This may impact performance in disaggregated deployments. Verify prefill workers are healthy and accessible."
                 );

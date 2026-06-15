@@ -16,7 +16,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::protocols::{
-    ActiveLoad, ActiveSequenceEvent, ActiveSequenceEventData, OverlapScores, WorkerWithDpRank,
+    ActiveLoad, ActiveSequenceEvent, ActiveSequenceEventData, LocalBlockHash, OverlapScores,
+    WorkerWithDpRank, compute_seq_hash_for_block,
 };
 use crate::sequence::{ActiveSequences, RequestId};
 
@@ -57,6 +58,44 @@ pub trait SequenceSubscriber: Send {
     ) -> impl Future<Output = Option<anyhow::Result<ActiveSequenceEvent>>> + Send;
 }
 
+/// Per-event diagnostic tracing toggle for the replica-sync wire protocol.
+///
+/// Gated behind `DYN_ROUTER_REPLICA_SYNC_TRACE=1`. When off (default), the
+/// `[replica-sync-pub]` / `[replica-sync-recv]` log lines are silent; turn
+/// on per-frontend during incident response to trace every published and
+/// received event. Volume is roughly the routing decision rate × the
+/// number of peers, so leave OFF in steady state.
+#[inline]
+fn replica_sync_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DYN_ROUTER_REPLICA_SYNC_TRACE")
+            .ok()
+            .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .is_some()
+    })
+}
+
+/// Object-safe handle for feeding a routing decision into the local indexer
+/// from the replica-sync receiver, decoupling `kv-router` from `lib/llm` where
+/// the concrete `Indexer` enum lives.
+///
+/// Implementations should be cheap to call — the indexer side typically just
+/// sends a `RoutingDecisionRequest` into an mpsc channel and returns.
+#[async_trait::async_trait]
+pub trait IndexerHandle: Send + Sync {
+    /// Update the local radix tree to reflect a routing decision that has
+    /// already happened (typically on a peer frontend replica). The hashes
+    /// arrive precomputed in the replica-sync wire format.
+    async fn apply_routing_decision_with_hashes(
+        &self,
+        worker: WorkerWithDpRank,
+        local_hashes: Vec<LocalBlockHash>,
+        sequence_hashes: Vec<SequenceHash>,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -84,6 +123,13 @@ pub enum SequenceError {
 pub struct SequenceRequest {
     pub request_id: RequestId,
     pub token_sequence: Option<Vec<SequenceHash>>,
+    /// Local block hashes parallel to `token_sequence`. When both are
+    /// present and the multi-worker tracker has an attached
+    /// [`IndexerHandle`], replica-sync also publishes these so peer
+    /// frontends can fold the routing decision into their local radix
+    /// tree. Required for cross-replica radix-tree sync in approximate
+    /// mode (`--no-router-kv-events`).
+    pub local_hashes: Option<Vec<LocalBlockHash>>,
     pub isl: usize,
     pub overlap: u32,
     pub expected_output_tokens: Option<u32>,
@@ -109,6 +155,11 @@ pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     publisher: P,
     replica_sync: bool,
     worker_type: &'static str,
+    /// Optional handle into the local radix-tree indexer. When set, the
+    /// replica-sync receiver feeds remote routing decisions into the local
+    /// tree so cache-hit decisions converge across frontend replicas in
+    /// approximate mode.
+    indexer: Option<Arc<dyn IndexerHandle>>,
 }
 
 impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
@@ -122,6 +173,29 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         replica_sync: bool,
         router_id: u64,
         worker_type: &'static str,
+    ) -> Self {
+        Self::new_with_indexer(
+            publisher,
+            block_size,
+            dp_range,
+            replica_sync,
+            router_id,
+            worker_type,
+            None,
+        )
+    }
+
+    /// Construct with an optional `IndexerHandle`; the receiver-side of
+    /// replica-sync will use it to update the local radix tree when peer
+    /// frontends publish routing decisions.
+    pub fn new_with_indexer(
+        publisher: P,
+        block_size: usize,
+        dp_range: &HashMap<u64, (u32, u32)>,
+        replica_sync: bool,
+        router_id: u64,
+        worker_type: &'static str,
+        indexer: Option<Arc<dyn IndexerHandle>>,
     ) -> Self {
         assert!(block_size > 1, "block_size must be greater than 1");
 
@@ -145,6 +219,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             publisher,
             replica_sync,
             worker_type,
+            indexer,
         }
     }
 
@@ -187,9 +262,21 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                         continue;
                     }
 
+                    if replica_sync_trace_enabled() {
+                        tracing::info!(
+                            worker_type = self.worker_type,
+                            my_router_id = self.router_id,
+                            peer_router_id = event.router_id,
+                            request_id = %event.request_id,
+                            kind = ?std::mem::discriminant(&event.data),
+                            "[replica-sync-recv] event"
+                        );
+                    }
+
                     match &event.data {
                         ActiveSequenceEventData::AddRequest {
                             token_sequence,
+                            local_hashes,
                             isl,
                             overlap,
                             expected_output_tokens,
@@ -215,6 +302,74 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                                     "Worker {:?} not found, cannot process AddRequest",
                                     event.worker
                                 );
+                            }
+
+                            // Replica-sync radix-tree extension: when the peer
+                            // shipped both block + sequence hashes AND we have
+                            // a local indexer to feed, fold this routing
+                            // decision into our local radix tree so subsequent
+                            // local requests see the cache. Lengths must match;
+                            // mismatches are dropped (and logged) rather than
+                            // poisoning the tree.
+                            if replica_sync_trace_enabled() {
+                                let indexer_present = self.indexer.is_some();
+                                let local_len = local_hashes.as_ref().map(|v| v.len());
+                                let seq_len = token_sequence.as_ref().map(|v| v.len());
+                                tracing::info!(
+                                    worker_type = self.worker_type,
+                                    request_id = %event.request_id,
+                                    indexer_present,
+                                    local_len = ?local_len,
+                                    seq_len = ?seq_len,
+                                    "[replica-sync-recv] AddRequest details"
+                                );
+                            }
+                            // Replica-sync radix-tree extension: when the peer
+                            // shipped block hashes AND we have a local indexer,
+                            // fold the routing decision into our local tree.
+                            //
+                            // CRITICAL: always derive seq_hashes from local_hashes
+                            // via `compute_seq_hash_for_block` — do NOT use the
+                            // producer-shipped `token_sequence`. The prefill
+                            // router sets `assume_kv_reuse: Some(false)` on
+                            // the decode handoff (prefill_router.rs:1208) → the
+                            // decode router's `compute_seq_hashes_for_tracking`
+                            // returns RANDOM per-request hashes. Those are fine
+                            // for the active-sequence tracker above (each
+                            // request manages its own IDs through Free) but
+                            // would cause "block_hash mismatch: sequence hashes
+                            // should be uniform across workers" warnings on the
+                            // radix tree, because the trie requires
+                            // deterministic seq_hashes uniform across all events
+                            // for a given prefix.
+                            //
+                            // Deriving from local_hashes matches the local-update
+                            // path (push_router.rs:443 → TokensWithHashes →
+                            // compute_seq_hash_for_block(block_hashes)), so the
+                            // trie sees one consistent (tokens_hash, block_hash)
+                            // mapping per prefix regardless of source.
+                            if let (Some(indexer), Some(local)) = (
+                                self.indexer.as_ref(),
+                                local_hashes.as_ref(),
+                            ) && !local.is_empty()
+                            {
+                                let seq_for_trie = compute_seq_hash_for_block(local);
+                                if replica_sync_trace_enabled() {
+                                    tracing::info!(
+                                        worker_type = self.worker_type,
+                                        request_id = %event.request_id,
+                                        worker = ?event.worker,
+                                        n_blocks = local.len(),
+                                        "[replica-sync-recv] applying routing decision to indexer"
+                                    );
+                                }
+                                indexer
+                                    .apply_routing_decision_with_hashes(
+                                        event.worker,
+                                        local.clone(),
+                                        seq_for_trie,
+                                    )
+                                    .await;
                             }
                         }
                         ActiveSequenceEventData::Free => {
@@ -296,6 +451,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         let SequenceRequest {
             request_id,
             token_sequence,
+            local_hashes,
             isl,
             overlap,
             expected_output_tokens,
@@ -320,6 +476,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 worker,
                 data: ActiveSequenceEventData::AddRequest {
                     token_sequence: token_sequence.clone(),
+                    local_hashes: local_hashes.clone(),
                     isl,
                     overlap,
                     expected_output_tokens,
@@ -327,6 +484,17 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 router_id: self.router_id,
                 lora_name: lora_name.clone(),
             };
+            if replica_sync_trace_enabled() {
+                tracing::info!(
+                    worker_type = self.worker_type,
+                    router_id = self.router_id,
+                    request_id = %request_id,
+                    worker = ?worker,
+                    seq_len = token_sequence.as_ref().map(|v| v.len()).unwrap_or(0),
+                    local_len = local_hashes.as_ref().map(|v| v.len()).unwrap_or(0),
+                    "[replica-sync-pub] AddRequest"
+                );
+            }
             self.publisher.publish_event(&event).await?;
         }
 
@@ -592,11 +760,34 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         (potential_blocks, potential_tokens)
     }
 
+    /// Snapshot one worker's live load (cached/uncached blocks, request
+    /// count). Returns `None` if the worker isn't tracked. Cheap;
+    /// suitable to call on every routing decision.
+    pub fn worker_load_snapshot(
+        &self,
+        worker: WorkerWithDpRank,
+    ) -> Option<crate::sequence::WorkerLoadSnapshot> {
+        self.workers
+            .get(&worker)
+            .map(|entry| entry.value().worker_load_snapshot())
+    }
+
     /// Query all workers for their current number of active blocks.
     pub fn active_blocks(&self) -> HashMap<WorkerWithDpRank, usize> {
         let mut results = HashMap::with_capacity(self.workers.len());
         for entry in self.workers.iter() {
             results.insert(*entry.key(), entry.value().active_blocks());
+        }
+        results
+    }
+
+    /// Query all workers for their current number of active (in-flight)
+    /// requests. Used by the v2 admission filter to gate workers whose
+    /// engine batch is already at capacity.
+    pub fn active_request_counts(&self) -> HashMap<WorkerWithDpRank, usize> {
+        let mut results = HashMap::with_capacity(self.workers.len());
+        for entry in self.workers.iter() {
+            results.insert(*entry.key(), entry.value().active_request_count());
         }
         results
     }

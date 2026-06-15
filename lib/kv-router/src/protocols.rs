@@ -170,6 +170,13 @@ pub struct WorkerSelectionResult {
     /// The number of blocks that the selected worker may already have cached.
     /// This is not a guarantee, but an estimate.
     pub overlap_blocks: u32,
+
+    /// The score the selector assigned to the chosen worker (lower is
+    /// better in `DefaultWorkerSelector`). Surfaced for observability so
+    /// each `router_decision` log line can record which logit drove the
+    /// pick. Custom selectors that don't use a logit may set this to
+    /// `f64::NAN` or `0.0`; consumers treat NaN as "unknown".
+    pub logit: f64,
 }
 
 /// Active load metrics for a worker, used for busy detection.
@@ -247,6 +254,15 @@ pub struct ActiveSequenceEvent {
 pub enum ActiveSequenceEventData {
     AddRequest {
         token_sequence: Option<Vec<SequenceHash>>,
+        // Local-block hashes parallel to `token_sequence` (one per block).
+        // Optional + default for rolling-upgrade compatibility: senders on the
+        // old wire format will deserialize as `None`, and receivers that see
+        // `None` simply skip the radix-tree update (no behavior change). When
+        // both `token_sequence` and `local_hashes` are present, the receiver
+        // also feeds them into the local indexer so the radix tree
+        // propagates across frontend replicas in approximate mode.
+        #[serde(default)]
+        local_hashes: Option<Vec<LocalBlockHash>>,
         isl: usize,
         overlap: u32,
         expected_output_tokens: Option<u32>,

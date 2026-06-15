@@ -4,11 +4,14 @@
 use super::KvRouterConfig;
 use super::RouterConfigOverride;
 use super::WorkerSelector;
-use super::protocols::{DpRank, OverlapScores, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
+use super::protocols::{
+    DpRank, LocalBlockHash, OverlapScores, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
+};
 use super::queue::SchedulerQueue;
 use super::sequence::{
     ActiveSequencesMulti, SequenceError, SequenceRequest, create_multi_worker_sequences,
 };
+use dynamo_kv_router::multi_worker_sequence::IndexerHandle;
 use crate::discovery::RuntimeConfigWatch;
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 use anyhow::Result;
@@ -42,6 +45,15 @@ pub enum KvSchedulerError {
 
     #[error("failed to initialize event publisher: {0}")]
     InitFailed(String),
+
+    /// Admission control intentionally rejected this request because all
+    /// candidate workers exceeded the configured per-worker thresholds.
+    /// Mapped to HTTP 429 + Retry-After (vs `NoEndpoints` which means
+    /// "no workers exist at all" → 500). Distinct variant so the http
+    /// boundary can tell "we said no on purpose" from "the cluster is
+    /// broken".
+    #[error("admission control rejected request (retry after {retry_after_secs}s)")]
+    AdmissionRejected { retry_after_secs: u32 },
 }
 
 #[derive(Debug)]
@@ -53,10 +65,22 @@ pub struct SchedulingResponse {
 pub struct SchedulingRequest {
     pub maybe_request_id: Option<String>,
     pub token_seq: Option<Vec<SequenceHash>>,
+    /// Parallel local-block hashes. Plumbed through so the multi-worker
+    /// tracker's replica-sync producer can include them in `AddRequest`
+    /// events (radix-tree extension).
+    pub local_hashes: Option<Vec<LocalBlockHash>>,
     pub isl_tokens: usize,
     pub overlaps: OverlapScores,
     pub decode_blocks: HashMap<WorkerWithDpRank, usize>,
     pub prefill_tokens: HashMap<WorkerWithDpRank, usize>,
+    /// Pre-this-request count of active (in-flight) sequences per worker.
+    /// Populated by the scheduler queue from `ActiveSequencesMulti::active_request_counts`
+    /// before calling `select_worker`. The v2 admission filter
+    /// (`TogetherSelector`) reads this to gate workers whose engine batch
+    /// is already at capacity. Empty map → filter treats all workers as
+    /// having zero active requests (safe default for callers that don't
+    /// populate it, e.g. tests).
+    pub pre_active_request_count: HashMap<WorkerWithDpRank, usize>,
     // Router config overrides for this specific request
     pub router_config_override: Option<RouterConfigOverride>,
     // Whether to update scheduler states (false for query_instance_id requests)
@@ -67,6 +91,9 @@ pub struct SchedulingRequest {
     pub priority_jump: f64,
     /// Optional set of allowed worker IDs to restrict routing decisions (EPP).
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
+    /// Optional partition label restricting routing to workers whose
+    /// ModelRuntimeConfig.partition_group matches (blast-radius isolation).
+    pub partition_group: Option<String>,
     resp_tx: Option<tokio::sync::oneshot::Sender<Result<SchedulingResponse, KvSchedulerError>>>,
 }
 
@@ -96,6 +123,7 @@ impl KvScheduler {
         selector: Option<Box<dyn WorkerSelector + Send + Sync>>,
         kv_router_config: &KvRouterConfig,
         worker_type: &'static str,
+        indexer_handle: Option<Arc<dyn IndexerHandle>>,
     ) -> Result<Self, KvSchedulerError> {
         let selector = selector.unwrap_or(Box::new(DefaultWorkerSelector::default()));
 
@@ -112,6 +140,7 @@ impl KvScheduler {
             kv_router_config.router_replica_sync,
             router_id,
             worker_type,
+            indexer_handle,
         )
         .await
         .map_err(|e| KvSchedulerError::InitFailed(e.to_string()))?;
@@ -205,12 +234,14 @@ impl KvScheduler {
         maybe_request_id: Option<String>,
         isl_tokens: usize,
         token_seq: Option<Vec<SequenceHash>>,
+        local_hashes: Option<Vec<LocalBlockHash>>,
         overlaps: OverlapScores,
         router_config_override: Option<&RouterConfigOverride>,
         update_states: bool,
         lora_name: Option<String>,
         priority_jump: f64,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
+        partition_group: Option<String>,
     ) -> Result<SchedulingResponse, KvSchedulerError> {
         #[cfg(feature = "bench")]
         let start = Instant::now();
@@ -219,15 +250,18 @@ impl KvScheduler {
         let request = SchedulingRequest {
             maybe_request_id,
             token_seq,
+            local_hashes,
             isl_tokens,
             overlaps,
             decode_blocks: HashMap::new(),
             prefill_tokens: HashMap::new(),
+            pre_active_request_count: HashMap::new(),
             router_config_override: router_config_override.cloned(),
             update_states,
             lora_name,
             priority_jump,
             allowed_worker_ids,
+            partition_group,
             resp_tx: Some(resp_tx),
         };
 
@@ -403,6 +437,27 @@ impl DefaultWorkerSelector {
     }
 }
 
+/// Cached value of `DYN_ROUTER_STICKY_OVERLAP_THRESHOLD_TOKENS`.
+///
+/// `Some(N)` means: when the best worker's cached overlap is `>= N`
+/// tokens, bypass the normal cost function and route to that worker,
+/// regardless of `active_blocks` load. Lets a deployment force perfect
+/// cache stickiness when there's a meaningful prefix to reuse —
+/// re-prefilling on a colder worker would cost far more than the
+/// load-balancing gain. Gating on cached overlap (not ISL) means
+/// large-but-cold requests still go through the normal load-balanced
+/// path. `None` (env unset or `0`) disables.
+fn sticky_overlap_threshold_tokens() -> Option<usize> {
+    use std::sync::OnceLock;
+    static THRESHOLD: OnceLock<Option<usize>> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("DYN_ROUTER_STICKY_OVERLAP_THRESHOLD_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
 impl WorkerSelector for DefaultWorkerSelector {
     fn select_worker(
         &self,
@@ -413,10 +468,31 @@ impl WorkerSelector for DefaultWorkerSelector {
         assert!(request.isl_tokens > 0);
 
         let allowed_ids = request.allowed_worker_ids.as_ref();
+        let partition_group = request.partition_group.as_deref();
 
-        if allowed_ids.map_or(workers.is_empty(), |ids| {
-            !workers.keys().any(|wid| ids.contains(wid))
-        }) {
+        // Workers must pass BOTH the allowed_worker_ids filter (EPP / migration retry
+        // exclusion) AND the partition_group filter (blast-radius isolation). Either
+        // unset ⇒ no constraint on that axis.
+        let eligible = |wid: &WorkerId, cfg: &ModelRuntimeConfig| -> bool {
+            allowed_ids.is_none_or(|ids| ids.contains(wid))
+                && partition_group.is_none_or(|g| cfg.partition_group.as_deref() == Some(g))
+        };
+
+        if partition_group.is_some() {
+            // Diagnostic: log every worker's partition_group vs request to verify the filter.
+            let summary: Vec<(WorkerId, Option<String>, bool)> = workers
+                .iter()
+                .map(|(wid, cfg)| (*wid, cfg.partition_group.clone(), eligible(wid, cfg)))
+                .collect();
+            tracing::info!(
+                request_id = ?request.maybe_request_id,
+                request_partition = ?partition_group,
+                workers = ?summary,
+                "[partition] scheduler eligibility check"
+            );
+        }
+
+        if !workers.iter().any(|(wid, cfg)| eligible(wid, cfg)) {
             return Err(KvSchedulerError::NoEndpoints);
         }
 
@@ -427,6 +503,96 @@ impl WorkerSelector for DefaultWorkerSelector {
         let decode_blocks = &request.decode_blocks;
         let prefill_tokens = &request.prefill_tokens;
 
+        // ── Sticky-overlap fast path ────────────────────────────────────
+        // When DYN_ROUTER_STICKY_OVERLAP_THRESHOLD_TOKENS is set and the
+        // best eligible worker's CACHED overlap meets the threshold in
+        // tokens, bypass the cost function and route to that worker
+        // regardless of `active_blocks` load. Gating on cached overlap
+        // (not ISL) means large-but-cold requests still go through the
+        // normal load-balanced path — sticky only fires when there's a
+        // meaningful prefix to reuse.
+        //
+        // Tie-break among workers at max overlap: lowest decode_blocks
+        // (least loaded), then random.
+        if let Some(threshold_tokens) = sticky_overlap_threshold_tokens() {
+            let eligible_workers: Vec<WorkerWithDpRank> = workers
+                .iter()
+                .filter(|(wid, cfg)| eligible(wid, cfg))
+                .flat_map(|(wid, cfg)| {
+                    let start = cfg.data_parallel_start_rank;
+                    let size = cfg.data_parallel_size;
+                    (start..start + size).map(move |dp| WorkerWithDpRank::new(*wid, dp))
+                })
+                .collect();
+
+            let max_overlap_blocks = eligible_workers
+                .iter()
+                .map(|w| *overlaps.get(w).unwrap_or(&0))
+                .max()
+                .unwrap_or(0);
+
+            // Convert blocks → tokens for the threshold comparison.
+            let max_overlap_tokens =
+                (max_overlap_blocks as usize).saturating_mul(block_size as usize);
+
+            if max_overlap_tokens >= threshold_tokens {
+                let tied: Vec<WorkerWithDpRank> = eligible_workers
+                    .iter()
+                    .copied()
+                    .filter(|w| *overlaps.get(w).unwrap_or(&0) == max_overlap_blocks)
+                    .collect();
+
+                let picked = if tied.len() == 1 {
+                    tied[0]
+                } else {
+                    // Tie-break by lowest decode_blocks; random among min-tied.
+                    let mut min_load = usize::MAX;
+                    let mut min_workers: Vec<WorkerWithDpRank> = Vec::new();
+                    for w in &tied {
+                        let load = *decode_blocks.get(w).unwrap_or(&0);
+                        if load < min_load {
+                            min_load = load;
+                            min_workers.clear();
+                            min_workers.push(*w);
+                        } else if load == min_load {
+                            min_workers.push(*w);
+                        }
+                    }
+                    if min_workers.len() == 1 {
+                        min_workers[0]
+                    } else {
+                        let idx = rand::rng().random_range(0..min_workers.len());
+                        min_workers[idx]
+                    }
+                };
+
+                tracing::info!(
+                    request_id = ?request.maybe_request_id,
+                    isl,
+                    threshold_tokens,
+                    cached_tokens = max_overlap_tokens,
+                    worker_id = picked.worker_id,
+                    dp_rank = picked.dp_rank,
+                    overlap_blocks = max_overlap_blocks,
+                    tied = tied.len(),
+                    "[sticky] forced max-overlap routing"
+                );
+
+                return Ok(WorkerSelectionResult {
+                    worker: picked,
+                    required_blocks: request_blocks as u64,
+                    overlap_blocks: max_overlap_blocks,
+                    // Sentinel: -1.0 marks sticky-bypass picks. Greppable
+                    // in [route] logs (logit=-1.000) for production
+                    // observability of how often the threshold fires.
+                    logit: -1.0,
+                });
+            }
+            // No eligible worker has enough cached tokens → fall through
+            // to the normal cost-function path so load balancing still
+            // applies for cold or low-cache requests.
+        }
+
         let mut worker_logits = HashMap::new();
 
         // Use override if provided, otherwise use default config
@@ -436,10 +602,7 @@ impl WorkerSelector for DefaultWorkerSelector {
             .and_then(|cfg| cfg.overlap_score_weight)
             .unwrap_or(self.kv_router_config.overlap_score_weight);
 
-        for (worker_id, config) in workers
-            .iter()
-            .filter(|(wid, _)| allowed_ids.is_none_or(|ids| ids.contains(wid)))
-        {
+        for (worker_id, config) in workers.iter().filter(|(wid, cfg)| eligible(wid, cfg)) {
             let data_parallel_size = config.data_parallel_size;
             let data_parallel_start_rank = config.data_parallel_start_rank;
 
@@ -536,6 +699,7 @@ impl WorkerSelector for DefaultWorkerSelector {
             worker: best_worker,
             required_blocks: request_blocks as u64,
             overlap_blocks: overlaps.get(&best_worker).copied().unwrap_or(0),
+            logit: best_logit,
         })
     }
 }

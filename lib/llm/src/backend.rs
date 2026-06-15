@@ -116,6 +116,30 @@ impl Backend {
     }
 }
 
+/// Map an `LLMEngineOutput` straight to a `BackendOutput` without running
+/// HF's `decode_stream` or stop-string matching. Used by the SMG-fronting
+/// gRPC path when `output_options.skip_detokenization` is set: SMG owns
+/// detokenization on its side, so the Backend just forwards token_ids.
+fn passthrough_engine_output(
+    data: LLMEngineOutput,
+    request_extra_args: Option<serde_json::Value>,
+) -> BackendOutput {
+    BackendOutput {
+        token_ids: data.token_ids,
+        tokens: vec![],
+        text: None,
+        cum_log_probs: data.cum_log_probs,
+        log_probs: data.log_probs,
+        top_logprobs: data.top_logprobs,
+        finish_reason: data.finish_reason,
+        stop_reason: data.stop_reason,
+        index: data.index,
+        extra_args: data.extra_args.or(request_extra_args),
+        completion_usage: data.completion_usage,
+        disaggregated_params: data.disaggregated_params,
+    }
+}
+
 #[async_trait]
 impl
     Operator<
@@ -130,6 +154,18 @@ impl
         request: SingleIn<PreprocessedRequest>,
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     ) -> Result<ManyOut<Annotated<BackendOutput>>> {
+        // [pin_trace:4/backend] Backend operator is a no-op for routing — confirm
+        // it passes through with the pin intact. If we see this log with the
+        // pin set but downstream loses it, the bug is between Backend and
+        // PrefillRouter (operator chaining shenanigans).
+        tracing::info!(
+            target: "dynamo::pin_trace",
+            request_id = %request.id(),
+            decode_instance_id = ?request.decode_instance_id,
+            routing_backend_instance_id = ?request.routing.as_ref().and_then(|r| r.backend_instance_id),
+            "[pin_trace:4/backend] Backend::generate entry (no-op routing-wise)"
+        );
+
         let stop_conditions = request.stop_conditions.clone();
 
         let prompt_token_ids = request.token_ids.clone();
@@ -147,9 +183,31 @@ impl
             .unwrap_or(false);
         let tracker = request.tracker.clone();
 
+        // [SMG] When the SMG-fronting gRPC servicer is in front of Dynamo,
+        // SMG owns detokenization + tool-call parsing on its side. We skip
+        // Backend-side detok so we don't run HF's decode_stream twice (once
+        // here, once in SMG). Stop-string matching is also skipped — SMG's
+        // create_stop_decoder handles it.
+        let skip_detokenization = request
+            .output_options
+            .skip_detokenization
+            .unwrap_or(false);
+
         let next_stream = next.generate(request).await?;
 
         let context = next_stream.context();
+
+        if skip_detokenization {
+            // Pure pass-through: forward LLMEngineOutput as BackendOutput
+            // without populating .text or running the stop decoder. Caller
+            // (SMG via gRPC servicer) reads .token_ids directly.
+            let pass_through = next_stream.map(move |annotated| {
+                let request_extra_args = request_extra_args.clone();
+                annotated.map_data(move |data| Ok(passthrough_engine_output(data, request_extra_args)))
+            });
+            return Ok(ResponseStream::new(Box::pin(pass_through), context));
+        }
+
         let state = self.decoder(
             next_stream,
             &prompt_token_ids,
@@ -720,5 +778,71 @@ mod tests {
             }
             other => panic!("Expected FinishReason::Error, got: {:?}", other),
         }
+    }
+
+    /// When `skip_detokenization` is set, the pass-through must forward
+    /// raw token_ids unchanged and leave `text` empty so SMG (or any other
+    /// caller doing its own detok) gets the engine's tokens verbatim.
+    #[test]
+    fn test_passthrough_engine_output_strips_text_keeps_tokens() {
+        let engine_out = LLMEngineOutput {
+            token_ids: vec![10, 20, 30],
+            tokens: Some(vec![Some("a".into()), Some("b".into()), Some("c".into())]),
+            text: Some("abc".into()),
+            cum_log_probs: Some(-0.5),
+            log_probs: None,
+            top_logprobs: None,
+            finish_reason: Some(FinishReason::Stop),
+            stop_reason: None,
+            index: Some(0),
+            extra_args: None,
+            completion_usage: None,
+            disaggregated_params: None,
+            ..Default::default()
+        };
+
+        let out = passthrough_engine_output(engine_out, None);
+
+        assert_eq!(out.token_ids, vec![10, 20, 30]);
+        assert!(out.tokens.is_empty(), "tokens must be cleared on pass-through");
+        assert_eq!(out.text, None, "text must be None on pass-through");
+        assert_eq!(out.cum_log_probs, Some(-0.5));
+        assert!(matches!(out.finish_reason, Some(FinishReason::Stop)));
+        assert_eq!(out.index, Some(0));
+    }
+
+    /// `request_extra_args` is the engine-side carry-through used to inject
+    /// fields like `cached_tokens` into the first emitted frame. The
+    /// pass-through must use it as a fallback when the engine output didn't
+    /// already supply its own extra_args.
+    #[test]
+    fn test_passthrough_engine_output_extra_args_fallback() {
+        let engine_out = LLMEngineOutput {
+            token_ids: vec![1],
+            extra_args: None,
+            ..Default::default()
+        };
+        let req_extra = Some(serde_json::json!({"cached_tokens": 42}));
+
+        let out = passthrough_engine_output(engine_out, req_extra.clone());
+        assert_eq!(out.extra_args, req_extra);
+    }
+
+    /// If the engine already supplied extra_args, those win over the
+    /// request-level fallback (matches the non-passthrough path's `or`
+    /// semantics).
+    #[test]
+    fn test_passthrough_engine_output_extra_args_engine_wins() {
+        let engine_extra = serde_json::json!({"engine_field": true});
+        let req_extra = serde_json::json!({"req_field": true});
+
+        let engine_out = LLMEngineOutput {
+            token_ids: vec![1],
+            extra_args: Some(engine_extra.clone()),
+            ..Default::default()
+        };
+
+        let out = passthrough_engine_output(engine_out, Some(req_extra));
+        assert_eq!(out.extra_args, Some(engine_extra));
     }
 }

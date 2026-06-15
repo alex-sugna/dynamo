@@ -474,6 +474,17 @@ impl ModelWatcher {
             // This is expensive, we are loading ~10MiB JSON, so only do it once
             let tokenizer = card.tokenizer().context("tokenizer")?;
 
+            // Decode-side runtime config watch for the prefill router's
+            // live-partition filter. `kv_chooser_for` above already created
+            // this watch, so this is the DashMap-cached fast path; we just
+            // hand it to the PrefillRouter so it can drop prefills whose
+            // partition has no surviving decodes (fail-fast vs. burning
+            // prefill compute on a doomed pipeline).
+            let decode_runtime_config_watch = self
+                .manager
+                .get_or_create_runtime_config_watcher(&endpoint)
+                .await?;
+
             // Create prefill chooser once if we're building pipelines
             // Both chat and completions will share the same prefill chooser instance
             let model_name = card.name().to_string();
@@ -494,6 +505,7 @@ impl ModelWatcher {
                         self.router_config.decode_fallback,
                         model_name.clone(),
                         namespace.clone(),
+                        Some(decode_runtime_config_watch.clone()),
                     )
                 });
 
@@ -720,20 +732,31 @@ impl ModelWatcher {
             // Note: activate_prefill_router is keyed by deployment namespace (not ws_key)
             // because it coordinates between decode and prefill WorkerSets that share
             // the same deployment namespace but have different ws_keys ("ns" vs "ns:prefill").
+            //
+            // [SMG-DYNAMO DEBUG] Loud log so we can correlate activation key with the
+            // key PrefillRouter::generate's pass-through warning logs (smg-dynamo-pd-kimi-mn
+            // diagnosis: every request was hitting the not-activated branch).
+            tracing::info!(
+                model_name = card.name(),
+                namespace = %namespace,
+                "[SMG-DYNAMO] Calling activate_prefill_router"
+            );
             let Ok(()) = self
                 .manager
                 .activate_prefill_router(card.name(), &namespace, endpoint)
             else {
                 tracing::warn!(
                     model_name = card.name(),
-                    "Failed to activate prefill router - prefill model may already be activated"
+                    namespace = %namespace,
+                    "[SMG-DYNAMO] Failed to activate prefill router - prefill model may already be activated"
                 );
                 return Ok(());
             };
 
             tracing::info!(
                 model_name = card.name(),
-                "Prefill model registered and router activated successfully"
+                namespace = %namespace,
+                "[SMG-DYNAMO] Prefill model registered and router activated successfully"
             );
 
             return Ok(());

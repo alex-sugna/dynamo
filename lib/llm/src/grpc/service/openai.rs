@@ -30,6 +30,92 @@ use tonic::Status;
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
+/// Map a stream-setup error from the engine pipeline to a tonic `Status`
+/// with the correct gRPC code so that SMG's HTTP boundary surfaces the
+/// right HTTP status to the client. Three distinguished cases:
+///
+///   * `KvSchedulerError::AdmissionRejected` → `ResourceExhausted` (429)
+///     — v2 admission filter rejected this request because per-worker
+///     capacity is exhausted. Embeds retry-after-Ns in the message so
+///     intermediaries that surface the body can echo the hint.
+///   * `KvSchedulerError::NoEndpoints` → `ResourceExhausted` (429)
+///     — no live decode in the partition the prefill router picked,
+///     after migration retries exhausted. Treat as 429 (transient
+///     saturation) rather than 500.
+///   * `DynamoError::InvalidArgument` → `InvalidArgument` (400) — the
+///     preprocessor raises this for client-validation failures
+///     (prompt + max_tokens exceeds context length, etc).
+///
+/// Anything else falls through to `Internal` (500) — a genuine server-
+/// side fault. Order matters: typed downcast for KvSchedulerError first
+/// (these only fire on internal admission/scheduler decisions and never
+/// cross the gRPC wire boundary), then DynamoError InvalidArgument,
+/// then fallback to Internal with the formatted error.
+///
+/// This replaces the substring-matching approach that previously lived
+/// in `grpc/service/trtllm.rs::engine_error_to_status` for the stream-
+/// setup path. The substring approach was reverted (db231a58a) because
+/// adding "include source error in PrefillError msg" so the substring
+/// would survive wrapping had the side effect of injecting `{` into
+/// wrapped error messages, which confused the JSON-finder used for the
+/// 400 path. Typed downcast avoids both problems.
+fn classify_setup_error(e: &anyhow::Error) -> Status {
+    use crate::kv_router::scheduler::KvSchedulerError;
+    use dynamo_runtime::error::{DynamoError, ErrorType};
+    // (1) Typed downcast first. Reliable for direct error chains where
+    //     the original `KvSchedulerError` or `DynamoError` is preserved
+    //     in the chain (e.g. when an upstream layer uses `#[from]` or
+    //     `#[source]` to thread the typed error through).
+    for cause in e.chain() {
+        if let Some(kse) = cause.downcast_ref::<KvSchedulerError>() {
+            return match kse {
+                KvSchedulerError::AdmissionRejected { retry_after_secs } => {
+                    Status::resource_exhausted(format!(
+                        "admission control rejected request (retry after {retry_after_secs}s)"
+                    ))
+                }
+                KvSchedulerError::NoEndpoints => Status::resource_exhausted(
+                    "no decode endpoints available; retry shortly",
+                ),
+                _ => continue,
+            };
+        }
+        if let Some(dyn_err) = cause.downcast_ref::<DynamoError>()
+            && dyn_err.error_type() == ErrorType::InvalidArgument
+        {
+            return Status::invalid_argument(dyn_err.message().to_string());
+        }
+    }
+
+    // (2) Substring fallback. The PrefillError wrapper at
+    //     `kv_router/prefill_router.rs::execute_prefill` boxes the
+    //     anyhow::Error into `Option<Box<dyn Error>>`, which type-
+    //     erases the original `KvSchedulerError`. The downcast above
+    //     misses on that chain. As a safety net we look at the chain's
+    //     formatted text — `KvSchedulerError::AdmissionRejected`'s
+    //     `#[error("admission control rejected request (retry after Ns)")]`
+    //     Display text is propagated into PrefillError's outer message
+    //     (see the explicit `{e:#}` embed at the map_err site). Same
+    //     pattern as `http/service/openai.rs::from_anyhow` ~line 257.
+    let chain_text = format!("{e:#}");
+    if chain_text.contains("admission control rejected request") {
+        let retry_after_secs = chain_text
+            .split("retry after ")
+            .nth(1)
+            .and_then(|s| s.split('s').next())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(2);
+        return Status::resource_exhausted(format!(
+            "admission control rejected request (retry after {retry_after_secs}s)"
+        ));
+    }
+    if chain_text.contains("no endpoints available to route work") {
+        return Status::resource_exhausted("no decode endpoints available; retry shortly");
+    }
+
+    Status::internal(format!("Failed to generate completions: {e}"))
+}
+
 // [gluo NOTE] strip down version of lib/llm/src/http/service/openai.rs
 // dupliating it here as the original file has coupling with HTTP objects.
 
@@ -94,7 +180,7 @@ pub async fn completion_response_stream(
     let stream = engine
         .generate(request)
         .await
-        .map_err(|e| Status::internal(format!("Failed to generate completions: {}", e)))?;
+        .map_err(|e| classify_setup_error(&e))?;
 
     // capture the context to cancel the stream if the client disconnects
     let ctx = stream.context();
@@ -322,6 +408,7 @@ impl TryFrom<inference::ModelInferRequest> for NvCreateCompletionRequest {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            multi_modal_data: None,
             unsupported_fields: Default::default(),
         })
     }

@@ -57,6 +57,14 @@ pub struct ModelRuntimeConfig {
     /// Bootstrap endpoint for disaggregated serving (prefill workers publish this)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disaggregated_endpoint: Option<DisaggregatedEndpoint>,
+
+    /// Optional partition label for blast-radius isolation. When set on prefill +
+    /// decode workers, the scheduler restricts decode picks to workers whose
+    /// partition_group matches the picked prefill's. Unset on every worker ⇒
+    /// no filtering (current behavior). Populated from DYN_PARTITION_GROUP env
+    /// at worker startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_group: Option<String>,
 }
 
 const fn default_data_parallel_start_rank() -> u32 {
@@ -85,6 +93,7 @@ impl Default for ModelRuntimeConfig {
             runtime_data: HashMap::new(),
             tensor_model_config: None,
             disaggregated_endpoint: None,
+            partition_group: None,
         }
     }
 }
@@ -92,6 +101,19 @@ impl Default for ModelRuntimeConfig {
 impl ModelRuntimeConfig {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Populate `partition_group` from the `DYN_PARTITION_GROUP` env var if set.
+    /// Idempotent: only writes when the field is currently None and env is non-empty.
+    /// Called from worker startup so the field surfaces on the registered
+    /// ModelDeploymentCard without requiring per-engine plumbing.
+    pub fn fill_partition_group_from_env(&mut self) {
+        if self.partition_group.is_none()
+            && let Ok(g) = std::env::var("DYN_PARTITION_GROUP")
+            && !g.is_empty()
+        {
+            self.partition_group = Some(g);
+        }
     }
 
     pub fn set_engine_specific<T: Serialize>(&mut self, key: &str, value: T) -> anyhow::Result<()> {

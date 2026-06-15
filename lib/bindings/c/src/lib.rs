@@ -494,6 +494,7 @@ impl RouterHandles {
                 None,
                 0.0,
                 allowed_worker_ids,
+                None, // partition_group: C bindings don't expose it yet
             )
             .await
             .map_err(|e| {
@@ -698,6 +699,15 @@ pub unsafe extern "C" fn create_routers(
             }
         };
 
+        // Decode-side runtime config watch (already created above by
+        // `kv_chooser_for`; this is the DashMap-cached fast path). Hand it to
+        // PrefillRouter so it can exclude prefill workers whose partition has
+        // no surviving decodes.
+        let decode_runtime_config_watch = model_manager
+            .get_or_create_runtime_config_watcher(&endpoint)
+            .await
+            .ok();
+
         // Create PrefillRouter based on one-time discovery of prefill workers
         // Auto-detects disaggregated mode by checking if prefill workers are present
         // The prefill workers have to be created before the epp is created.
@@ -721,6 +731,7 @@ pub unsafe extern "C" fn create_routers(
                     decode_fallback,
                     model_name.clone(),
                     namespace_str.clone(),
+                    decode_runtime_config_watch.clone(),
                 )
             }
             None if !decode_fallback => {

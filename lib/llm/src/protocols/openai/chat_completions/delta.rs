@@ -464,6 +464,11 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
                 timing: timing_info,
                 token_ids: token_ids.clone(),
                 routed_experts,
+                // raw_logprobs is only consumed by the SMG-via-gRPC
+                // path which uses the completions delta; chat clients
+                // get logprobs via the OpenAI Choice.logprobs field on
+                // this same response.
+                raw_logprobs: None,
             };
 
             if let Ok(nvext_json) = serde_json::to_value(&nvext_response) {

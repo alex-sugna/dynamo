@@ -1054,6 +1054,22 @@ impl KvIndexer {
             .map_err(|_| KvRouterError::IndexerDroppedRequest)?;
         Ok(())
     }
+
+    /// Apply a routing decision using pre-computed block + sequence hashes.
+    ///
+    /// Used by the replica-sync receiver to fold a peer router's routing
+    /// decision into the local radix tree — same effect as
+    /// `process_routing_decision_for_request`, but the caller already has
+    /// the hashes from the wire-format event and never sees the raw tokens.
+    pub async fn apply_routing_decision_with_hashes(
+        &self,
+        worker: WorkerWithDpRank,
+        local_hashes: Vec<LocalBlockHash>,
+        sequence_hashes: Vec<SequenceHash>,
+    ) -> Result<(), KvRouterError> {
+        self.process_routing_decision_internal(worker, local_hashes, sequence_hashes)
+            .await
+    }
 }
 
 impl Drop for KvIndexer {
@@ -1897,6 +1913,18 @@ impl KvIndexerSharded {
             .await
             .map_err(|_| KvRouterError::IndexerDroppedRequest)?;
         Ok(())
+    }
+
+    /// Apply a routing decision using pre-computed block + sequence hashes.
+    /// See [`KvIndexer::apply_routing_decision_with_hashes`] for context.
+    pub async fn apply_routing_decision_with_hashes(
+        &self,
+        worker: WorkerWithDpRank,
+        local_hashes: Vec<LocalBlockHash>,
+        sequence_hashes: Vec<SequenceHash>,
+    ) -> Result<(), KvRouterError> {
+        self.process_routing_decision_internal(worker, local_hashes, sequence_hashes)
+            .await
     }
 }
 

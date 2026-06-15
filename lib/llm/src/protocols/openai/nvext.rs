@@ -91,6 +91,38 @@ pub struct NvExtResponse {
     /// Routed expert capture payload (SGLang-specific)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routed_experts: Option<serde_json::Value>,
+
+    /// Raw per-token logprobs preserving `token_id` for each chosen token
+    /// AND for each top-k alternative. The OpenAI `Logprobs` shape on
+    /// `Choice.logprobs` drops token_ids on the alternatives, leaving only
+    /// the decoded token strings. SMG's TrtllmService consumer needs
+    /// token_ids to detokenize top alternatives via its own tokenizer
+    /// (the chosen token's id is already in nvext.token_ids). This field
+    /// is the lossless side channel.
+    ///
+    /// Shape per position:
+    ///   { "token_id": u32, "logprob": f32,
+    ///     "top_logprobs": [{ "token_id": u32, "logprob": f32 }, ...] }
+    ///
+    /// HTTP/OpenAI clients ignore unknown nvext fields, so this is
+    /// additive — no impact on the HTTP path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_logprobs: Option<Vec<RawTokenLogprob>>,
+}
+
+/// Per-position lossless logprob payload — preserves `token_id` for
+/// alternatives so the gRPC consumer can detokenize on its side.
+#[derive(ToSchema, Serialize, Deserialize, Debug, Clone)]
+pub struct RawTokenLogprob {
+    pub token_id: u32,
+    pub logprob: f32,
+    pub top_logprobs: Vec<RawTopLogprob>,
+}
+
+#[derive(ToSchema, Serialize, Deserialize, Debug, Clone)]
+pub struct RawTopLogprob {
+    pub token_id: u32,
+    pub logprob: f32,
 }
 
 /// NVIDIA LLM extensions to the OpenAI API

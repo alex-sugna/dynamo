@@ -20,6 +20,49 @@ const DEFAULT_PREFILL_COMPONENT_NAME: &str = "prefill";
 const DEFAULT_E2E_HEALTH_CHECK_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_E2E_LAST_HEALTHY_TIMEOUT_SECS: u64 = 10;
 
+/// Validate an HTTP-200 e2e probe response body. Mirror of the helper in
+/// `system_status_server.rs`; see that file for full rationale.
+/// Gate is `usage.completion_tokens > 0` — shape-agnostic so it handles
+/// content / reasoning_content (thinking models) / tool_calls uniformly.
+async fn validate_e2e_response_body(
+    response: reqwest::Response,
+) -> std::result::Result<(), String> {
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("read body: {e}"))?;
+    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(format!(
+                "parse JSON: {e}; body[..500]={}",
+                body.chars().take(500).collect::<String>()
+            ));
+        }
+    };
+    if let Some(err) = parsed.get("error") {
+        return Err(format!(
+            "top-level error: {err}; body[..500]={}",
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    let completion_tokens = parsed
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if completion_tokens == 0 {
+        let finish = parsed
+            .pointer("/choices/0/finish_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        return Err(format!(
+            "completion_tokens=0 (finish_reason={finish}); body[..500]={}",
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
 fn get_e2e_health_check_timeout() -> Duration {
     std::env::var(E2E_HEALTH_CHECK_TIMEOUT_ENV)
         .ok()
@@ -250,7 +293,7 @@ async fn frontend_health_handler(
         Ok(instances) => {
             instances
                 .iter()
-                .filter(|i| target_namespace.as_ref().map_or(true, |ns| &i.namespace == ns))
+                .filter(|i| target_namespace.as_ref().map_or(false, |ns| &i.namespace == ns))
                 .filter(|i| i.component == prefill_component_name)
                 .map(|i| i.instance_id)
                 .collect()
@@ -296,7 +339,7 @@ async fn frontend_health_handler(
         let health_request = json!({
             "model": model,
             "messages": [{"role": "user", "content": "hi"}],
-            "max_completion_tokens": 1,
+            "max_completion_tokens": 2,
             "stream": false,
             "temperature": 0.0,
             "nvext": {
@@ -322,28 +365,42 @@ async fn frontend_health_handler(
 
         match result {
             Ok(response) if response.status().is_success() => {
-                let elapsed = start_time.elapsed();
-                *health_state.last_healthy.write().await = Some(Instant::now());
+                match validate_e2e_response_body(response).await {
+                    Ok(()) => {
+                        let elapsed = start_time.elapsed();
+                        *health_state.last_healthy.write().await = Some(Instant::now());
 
-                tracing::info!(
-                    "[frontend health] PASSED via prefill worker {} in {:?} (attempts={}/{})",
-                    prefill_id,
-                    elapsed,
-                    tried_count,
-                    prefill_instance_ids.len()
-                );
+                        tracing::info!(
+                            "[frontend health] PASSED via prefill worker {} in {:?} (attempts={}/{})",
+                            prefill_id,
+                            elapsed,
+                            tried_count,
+                            prefill_instance_ids.len()
+                        );
 
-                return (
-                    StatusCode::OK,
-                    Json(json!({
-                        "status": "healthy",
-                        "e2e_check": "passed",
-                        "prefill_worker_used": prefill_id,
-                        "prefill_workers_tried": tried_count,
-                        "prefill_workers_total": prefill_instance_ids.len(),
-                        "latency_ms": elapsed.as_millis()
-                    })),
-                );
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "status": "healthy",
+                                "e2e_check": "passed",
+                                "prefill_worker_used": prefill_id,
+                                "prefill_workers_tried": tried_count,
+                                "prefill_workers_total": prefill_instance_ids.len(),
+                                "latency_ms": elapsed.as_millis()
+                            })),
+                        );
+                    }
+                    Err(body_err) => {
+                        last_error = format!("HTTP 200 but body invalid: {body_err}");
+                        tracing::warn!(
+                            "[frontend health] Attempt {}/{}: Prefill worker {} returned HTTP 200 with bad body: {}",
+                            tried_count,
+                            prefill_instance_ids.len(),
+                            prefill_id,
+                            body_err
+                        );
+                    }
+                }
             }
             Ok(response) => {
                 let status = response.status();

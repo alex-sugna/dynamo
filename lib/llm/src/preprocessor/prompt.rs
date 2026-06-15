@@ -91,6 +91,19 @@ pub trait OAIChatLikeRequest {
     fn media_io_kwargs(&self) -> Option<&MediaDecoder> {
         None
     }
+
+    /// Pre-populated multimodal data the request already carries (e.g., set
+    /// by `lib/llm/src/grpc/service/trtllm.rs::proto_to_completion_request`
+    /// when SMG packs raw image bytes into the gRPC `MultimodalInput.image_data`
+    /// side-channel). When `Some`, `gather_multi_modal_data` should honor this
+    /// directly instead of scanning `typed_messages()` — necessary for the
+    /// completions path, which has no chat-style messages but still needs
+    /// vision data plumbed through to the worker.
+    fn preexisting_multi_modal_data(
+        &self,
+    ) -> Option<&crate::protocols::openai::completions::MultiModalData> {
+        None
+    }
 }
 
 pub trait OAIPromptFormatter: Send + Sync + 'static {

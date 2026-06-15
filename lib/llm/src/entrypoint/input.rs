@@ -21,6 +21,7 @@ pub mod endpoint;
 pub mod grpc;
 pub mod http;
 pub mod text;
+pub mod trtllm_grpc;
 
 use dynamo_runtime::protocols::ENDPOINT_SCHEME;
 
@@ -46,6 +47,12 @@ pub enum Input {
 
     // Run an KServe compatible gRPC server
     Grpc,
+
+    /// Run the TrtllmService gRPC server. This exposes the same gRPC contract
+    /// Together's TRT-LLM/vLLM/SGLang engines speak so external routers like
+    /// Shepherd Model Gateway can drive this Dynamo instance with pre-tokenized
+    /// input. See `crate::grpc::service::trtllm`.
+    TrtllmGrpc,
 }
 
 impl FromStr for Input {
@@ -63,6 +70,7 @@ impl TryFrom<&str> for Input {
         match s {
             "http" => Ok(Input::Http),
             "grpc" => Ok(Input::Grpc),
+            "trtllm_grpc" => Ok(Input::TrtllmGrpc),
             "text" => Ok(Input::Text),
             "stdin" => Ok(Input::Stdin),
             endpoint_path if endpoint_path.starts_with(ENDPOINT_SCHEME) => {
@@ -82,6 +90,7 @@ impl fmt::Display for Input {
         let s = match self {
             Input::Http => "http",
             Input::Grpc => "grpc",
+            Input::TrtllmGrpc => "trtllm_grpc",
             Input::Text => "text",
             Input::Stdin => "stdin",
             Input::Endpoint(path) => path,
@@ -127,6 +136,9 @@ pub async fn run_input(
         }
         Input::Grpc => {
             grpc::run(drt, engine_config).await?;
+        }
+        Input::TrtllmGrpc => {
+            trtllm_grpc::run(drt, engine_config).await?;
         }
         Input::Text => {
             text::run(drt, None, engine_config).await?;

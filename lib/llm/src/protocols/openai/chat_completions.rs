@@ -264,6 +264,10 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
         self.common.skip_special_tokens
     }
 
+    fn get_skip_detokenization(&self) -> Option<bool> {
+        self.common.skip_detokenization
+    }
+
     fn get_dynamic_sampling(&self) -> Option<crate::protocols::common::DynamicSamplingOption> {
         self.common.dynamic_sampling.clone()
     }
@@ -333,6 +337,10 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
 
     fn get_skip_special_tokens(&self) -> Option<bool> {
         CommonExtProvider::get_skip_special_tokens(self)
+    }
+
+    fn get_skip_detokenization(&self) -> Option<bool> {
+        CommonExtProvider::get_skip_detokenization(self)
     }
 
     fn get_formatted_prompt(&self) -> Option<bool> {
@@ -432,6 +440,51 @@ mod tests {
                 .expect("Failed to extract output options");
 
             assert_eq!(output_options.skip_special_tokens, Some(skip_value));
+        }
+    }
+
+    #[test]
+    fn test_skip_detokenization_none() {
+        let json_str = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+
+        assert_eq!(request.common.skip_detokenization, None);
+
+        let output_options = request
+            .extract_output_options()
+            .expect("Failed to extract output options");
+
+        assert_eq!(output_options.skip_detokenization, None);
+    }
+
+    #[test]
+    fn test_skip_detokenization_propagates() {
+        for skip_value in [true, false] {
+            let json_str = json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": "Hello"}
+                ],
+                "skip_detokenization": skip_value
+            });
+
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(json_str).expect("Failed to deserialize request");
+
+            assert_eq!(request.common.skip_detokenization, Some(skip_value));
+
+            let output_options = request
+                .extract_output_options()
+                .expect("Failed to extract output options");
+
+            assert_eq!(output_options.skip_detokenization, Some(skip_value));
         }
     }
 }

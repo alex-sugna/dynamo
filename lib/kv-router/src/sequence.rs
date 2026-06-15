@@ -32,6 +32,22 @@ const EXPIRY_DURATION: Duration = Duration::from_secs(300);
 // TODO: use the common request_id if it exists in the repo
 pub type RequestId = String;
 
+/// Per-worker live-load snapshot consumed by routing-decision
+/// observability. All counts are in blocks (integer); convert to
+/// tokens by multiplying by `block_size` if needed.
+///
+/// - `active_cached_blocks` — total unique cached blocks held by
+///   currently-active requests on this worker.
+/// - `active_uncached_blocks` — pending prefill compute on this
+///   worker, in blocks (across all active requests).
+/// - `active_request_count` — number of in-flight requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerLoadSnapshot {
+    pub active_cached_blocks: usize,
+    pub active_uncached_blocks: usize,
+    pub active_request_count: usize,
+}
+
 /// A multi-request sequence manager that handles multiple active sequences with shared KV cache
 #[derive(Debug, Getters)]
 pub struct ActiveSequences {
@@ -111,6 +127,27 @@ impl ActiveSequences {
             }
         }
         count.round() as usize
+    }
+
+    /// Number of currently-active requests on this worker.
+    pub fn active_request_count(&self) -> usize {
+        self.active_seqs.len()
+    }
+
+    /// Snapshot of this worker's live load — `(active_cached_blocks,
+    /// active_uncached_blocks, active_request_count)`. Used by the
+    /// `dynamo::observability::router_decision` log line emitted at
+    /// every routing pick. Cheap to call (no allocation).
+    pub fn worker_load_snapshot(&self) -> WorkerLoadSnapshot {
+        WorkerLoadSnapshot {
+            active_cached_blocks: self.active_blocks(),
+            // self.active_tokens accumulates *uncached* prefill tokens
+            // across all in-flight requests on this worker
+            // (mark_prefill_completed subtracts on prefill done). Convert
+            // to blocks via integer division — enough for trend lines.
+            active_uncached_blocks: self.active_tokens / self.block_size,
+            active_request_count: self.active_seqs.len(),
+        }
     }
 
     /// Find all blocks in a request that have only a single strong reference (only used by this request)

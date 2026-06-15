@@ -10,6 +10,7 @@ use std::{fs::File, io::BufReader, path::Path};
 
 use anyhow::Context as _;
 
+pub mod admission;
 pub mod backend;
 pub mod common;
 pub mod discovery;
@@ -29,6 +30,7 @@ pub mod mocker;
 pub mod model_card;
 pub mod model_type;
 pub mod namespace;
+pub mod observability;
 pub mod perf;
 pub mod preprocessor;
 pub mod protocols;

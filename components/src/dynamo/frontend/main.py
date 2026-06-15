@@ -241,6 +241,11 @@ async def async_main():
         kwargs["namespace_prefix"] = config.namespace_prefix
     if config.kserve_grpc_server and config.grpc_metrics_port:
         kwargs["http_metrics_port"] = config.grpc_metrics_port
+    # NOTE: --trtllm-grpc-port is currently a documentation-only flag; the Rust
+    # entrypoint reads --http-port for the gRPC bind port (mirroring kserve's
+    # behavior). Plumbing trtllm_grpc_port through EntrypointArgs as a distinct
+    # field is M3 polish; for now the user passes --http-port 9001 alongside
+    # --trtllm-grpc-server.
 
     if config.enable_anthropic_api:
         os.environ["DYN_ENABLE_ANTHROPIC_API"] = "1"
@@ -262,6 +267,11 @@ async def async_main():
             await run_input(runtime, "text", engine)
         elif config.kserve_grpc_server:
             await run_input(runtime, "grpc", engine)
+        elif config.trtllm_grpc_server:
+            # External-router contract used by SMG; same engine plane as the
+            # http path, just a different ingress shape (pre-tokenized in,
+            # raw token-IDs out). See lib/llm/src/grpc/service/trtllm.rs.
+            await run_input(runtime, "trtllm_grpc", engine)
         else:
             await run_input(runtime, "http", engine)
     except asyncio.exceptions.CancelledError:

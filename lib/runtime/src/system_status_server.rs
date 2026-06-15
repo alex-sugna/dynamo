@@ -58,6 +58,61 @@ fn get_e2e_health_check_timeout() -> Duration {
 }
 
 /// Get the last healthy cache timeout from environment or default
+/// Validate an HTTP-200 e2e probe response body. Returns Ok(()) only if
+/// the assembled completion shows the engine actually generated tokens —
+/// shape-agnostic, so it handles content / reasoning_content (thinking
+/// models like Kimi K2.6) / tool_calls / multimodal uniformly. An
+/// HTTP-200-with-empty/error body is the case the worker-side
+/// push_handler stamp gate doesn't cover: trtllm yields error chunks as
+/// data-level FinishReason::Error and the upstream HTTP layer doesn't
+/// always promote those to 5xx, so the e2e check itself must inspect
+/// the body before declaring "passed" and stamping `last_healthy`
+/// (which would feed Bypass A for 30s).
+///
+/// Gate is `usage.completion_tokens > 0`: definitive proof the engine
+/// emitted at least one output token. Earlier versions checked
+/// `choices[0].message.content` only, which falsely rejected thinking
+/// models that put their first token in `reasoning_content` with
+/// `max_completion_tokens: 2`.
+async fn validate_e2e_response_body(
+    response: reqwest::Response,
+) -> std::result::Result<(), String> {
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("read body: {e}"))?;
+    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(format!(
+                "parse JSON: {e}; body[..500]={}",
+                body.chars().take(500).collect::<String>()
+            ));
+        }
+    };
+    if let Some(err) = parsed.get("error") {
+        return Err(format!(
+            "top-level error: {err}; body[..500]={}",
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    let completion_tokens = parsed
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if completion_tokens == 0 {
+        let finish = parsed
+            .pointer("/choices/0/finish_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        return Err(format!(
+            "completion_tokens=0 (finish_reason={finish}); body[..500]={}",
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
 fn get_e2e_last_healthy_timeout() -> Duration {
     std::env::var(E2E_LAST_HEALTHY_TIMEOUT_ENV)
         .ok()
@@ -885,10 +940,22 @@ async fn decode_e2e_health_check_with_prefill_fallback(
                 prefill_component_name
             );
 
+            // Scope to this DGD's dynamo namespace so a sibling deployment sharing the
+            // etcd cluster doesn't bleed in (operator sets DYN_NAMESPACE = {k8sNs}-{dgdName}).
+            // Unset env ⇒ empty string ⇒ no instance matches ⇒ "no prefills found" path fires.
+            let target_ns = std::env::var("DYN_NAMESPACE").unwrap_or_default();
             match list_all_instances(state.drt().discovery()).await {
                 Ok(instances) => {
+                    let foreign = instances.iter().filter(|i| i.namespace != target_ns).count();
+                    if foreign > 0 {
+                        tracing::error!(
+                            local_namespace = %target_ns, foreign_count = foreign,
+                            "[decode e2e health] cross-namespace discovery sightings dropped"
+                        );
+                    }
                     let prefill_ids: Vec<u64> = instances
                         .iter()
+                        .filter(|instance| instance.namespace == target_ns)
                         .filter(|instance| instance.component == prefill_component_name)
                         .map(|instance| instance.instance_id)
                         .collect();
@@ -944,7 +1011,7 @@ async fn decode_e2e_health_check_with_prefill_fallback(
             let health_request = json!({
                 "model": model,
                 "messages": [{"role": "user", "content": "hi"}],
-                "max_completion_tokens": 1,
+                "max_completion_tokens": 2,
                 "stream": false,
                 "temperature": 0.0,
                 "nvext": {
@@ -974,33 +1041,47 @@ async fn decode_e2e_health_check_with_prefill_fallback(
 
             match result {
                 Ok(response) if response.status().is_success() => {
-                    let elapsed = start_time.elapsed();
-                    *e2e_state.last_healthy.write().await = Some(Instant::now());
+                    match validate_e2e_response_body(response).await {
+                        Ok(()) => {
+                            let elapsed = start_time.elapsed();
+                            *e2e_state.last_healthy.write().await = Some(Instant::now());
 
-                    tracing::info!(
-                        "[decode e2e health] PASSED via prefill worker {} in {:?} (decode_instance_id={}, attempts={}/{})",
-                        prefill_id,
-                        elapsed,
-                        decode_instance_id,
-                        tried_count,
-                        prefill_instance_ids.len()
-                    );
+                            tracing::info!(
+                                "[decode e2e health] PASSED via prefill worker {} in {:?} (decode_instance_id={}, attempts={}/{})",
+                                prefill_id,
+                                elapsed,
+                                decode_instance_id,
+                                tried_count,
+                                prefill_instance_ids.len()
+                            );
 
-                    return (
-                        StatusCode::OK,
-                        json!({
-                            "status": "healthy",
-                            "worker_type": "decode",
-                            "decode_instance_id": decode_instance_id,
-                            "e2e_check": "passed",
-                            "prefill_worker_used": prefill_id,
-                            "prefill_workers_tried": tried_count,
-                            "prefill_workers_total": prefill_instance_ids.len(),
-                            "latency_ms": elapsed.as_millis()
-                        })
-                        .to_string(),
-                    )
-                        .into_response();
+                            return (
+                                StatusCode::OK,
+                                json!({
+                                    "status": "healthy",
+                                    "worker_type": "decode",
+                                    "decode_instance_id": decode_instance_id,
+                                    "e2e_check": "passed",
+                                    "prefill_worker_used": prefill_id,
+                                    "prefill_workers_tried": tried_count,
+                                    "prefill_workers_total": prefill_instance_ids.len(),
+                                    "latency_ms": elapsed.as_millis()
+                                })
+                                .to_string(),
+                            )
+                                .into_response();
+                        }
+                        Err(body_err) => {
+                            last_error = format!("HTTP 200 but body invalid: {body_err}");
+                            tracing::warn!(
+                                "[decode e2e health] Attempt {}/{}: Prefill worker {} returned HTTP 200 with bad body: {}",
+                                tried_count,
+                                prefill_instance_ids.len(),
+                                prefill_id,
+                                body_err
+                            );
+                        }
+                    }
                 }
                 Ok(response) => {
                     let status = response.status();
@@ -1066,7 +1147,7 @@ async fn decode_e2e_health_check_with_prefill_fallback(
     let health_request = json!({
         "model": model,
         "messages": [{"role": "user", "content": "hi"}],
-        "max_completion_tokens": 1,
+        "max_completion_tokens": 2,
         "stream": false,
         "temperature": 0.0,
         "nvext": {
@@ -1102,27 +1183,51 @@ async fn decode_e2e_health_check_with_prefill_fallback(
             );
 
             if status.is_success() {
-                *e2e_state.last_healthy.write().await = Some(Instant::now());
+                match validate_e2e_response_body(response).await {
+                    Ok(()) => {
+                        *e2e_state.last_healthy.write().await = Some(Instant::now());
 
-                tracing::info!(
-                    "[decode e2e health] PASSED in {:?} (decode_instance_id={}, no prefill targeting)",
-                    elapsed,
-                    decode_instance_id
-                );
+                        tracing::info!(
+                            "[decode e2e health] PASSED in {:?} (decode_instance_id={}, no prefill targeting)",
+                            elapsed,
+                            decode_instance_id
+                        );
 
-                (
-                    StatusCode::OK,
-                    json!({
-                        "status": "healthy",
-                        "worker_type": "decode",
-                        "decode_instance_id": decode_instance_id,
-                        "e2e_check": "passed",
-                        "prefill_targeting": "none",
-                        "latency_ms": elapsed.as_millis()
-                    })
-                    .to_string(),
-                )
-                    .into_response()
+                        return (
+                            StatusCode::OK,
+                            json!({
+                                "status": "healthy",
+                                "worker_type": "decode",
+                                "decode_instance_id": decode_instance_id,
+                                "e2e_check": "passed",
+                                "prefill_targeting": "none",
+                                "latency_ms": elapsed.as_millis()
+                            })
+                            .to_string(),
+                        )
+                            .into_response();
+                    }
+                    Err(body_err) => {
+                        tracing::warn!(
+                            "[decode e2e health] FAILED: HTTP 200 but body invalid: {} (decode_instance_id={})",
+                            body_err,
+                            decode_instance_id
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({
+                                "status": "unhealthy",
+                                "worker_type": "decode",
+                                "decode_instance_id": decode_instance_id,
+                                "e2e_check": "failed",
+                                "error": format!("HTTP 200 with empty/error body: {body_err}"),
+                                "latency_ms": elapsed.as_millis()
+                            })
+                            .to_string(),
+                        )
+                            .into_response();
+                    }
+                }
             } else {
                 let error_body = response.text().await.unwrap_or_default();
                 tracing::warn!(
@@ -1331,7 +1436,7 @@ async fn worker_e2e_health_check(
         json!({
             "model": model,
             "messages": [{"role": "user", "content": "hi"}],
-            "max_completion_tokens": 1,
+            "max_completion_tokens": 2,
             "stream": false,
             "temperature": 0.0,
             "nvext": {
@@ -1347,7 +1452,7 @@ async fn worker_e2e_health_check(
         json!({
             "model": model,
             "messages": [{"role": "user", "content": "hi"}],
-            "max_completion_tokens": 1,
+            "max_completion_tokens": 2,
             "stream": false,
             "temperature": 0.0
         })
@@ -1386,28 +1491,52 @@ async fn worker_e2e_health_check(
             );
 
             if status.is_success() {
-                // Update last healthy timestamp
-                *e2e_state.last_healthy.write().await = Some(Instant::now());
+                match validate_e2e_response_body(response).await {
+                    Ok(()) => {
+                        *e2e_state.last_healthy.write().await = Some(Instant::now());
 
-                tracing::info!(
-                    "[{} e2e health] PASSED in {:?} (instance_id={})",
-                    worker_type,
-                    elapsed,
-                    instance_id
-                );
+                        tracing::info!(
+                            "[{} e2e health] PASSED in {:?} (instance_id={})",
+                            worker_type,
+                            elapsed,
+                            instance_id
+                        );
 
-                (
-                    StatusCode::OK,
-                    json!({
-                        "status": "healthy",
-                        "worker_type": worker_type,
-                        "instance_id": instance_id,
-                        "e2e_check": "passed",
-                        "latency_ms": elapsed.as_millis()
-                    })
-                    .to_string(),
-                )
-                    .into_response()
+                        return (
+                            StatusCode::OK,
+                            json!({
+                                "status": "healthy",
+                                "worker_type": worker_type,
+                                "instance_id": instance_id,
+                                "e2e_check": "passed",
+                                "latency_ms": elapsed.as_millis()
+                            })
+                            .to_string(),
+                        )
+                            .into_response();
+                    }
+                    Err(body_err) => {
+                        tracing::warn!(
+                            "[{} e2e health] FAILED: HTTP 200 but body invalid: {} (instance_id={})",
+                            worker_type,
+                            body_err,
+                            instance_id
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({
+                                "status": "unhealthy",
+                                "worker_type": worker_type,
+                                "instance_id": instance_id,
+                                "e2e_check": "failed",
+                                "error": format!("HTTP 200 with empty/error body: {body_err}"),
+                                "latency_ms": elapsed.as_millis()
+                            })
+                            .to_string(),
+                        )
+                            .into_response();
+                    }
+                }
             } else {
                 let error_body = response.text().await.unwrap_or_default();
                 tracing::warn!(

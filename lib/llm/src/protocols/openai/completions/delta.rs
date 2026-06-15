@@ -7,7 +7,7 @@ use super::{NvCreateCompletionRequest, NvCreateCompletionResponse};
 use crate::{
     protocols::{
         common::{self, timing::RequestTracker},
-        openai::nvext::{NvExtProvider, NvExtResponse, TimingInfo},
+        openai::nvext::{NvExtProvider, NvExtResponse, RawTokenLogprob, RawTopLogprob, TimingInfo},
     },
     types::TokenIdType,
 };
@@ -84,6 +84,44 @@ pub struct DeltaGeneratorOptions {
     pub continuous_usage_stats: bool,
     pub enable_logprobs: bool,
     pub enable_tracking: bool,
+}
+
+/// Build the lossless raw-logprobs payload that rides through nvext for
+/// the SMG-via-gRPC consumer. The OpenAI `Logprobs` shape that
+/// `DeltaGenerator::create_logprobs` produces drops `token_id` on every
+/// alternative — only the decoded strings remain. SMG needs the
+/// token_ids to detokenize on its side. Returns None unless BOTH the
+/// per-token chosen logprobs AND the per-position top-k are present.
+pub(crate) fn build_raw_logprobs(
+    log_probs: Option<&[f64]>,
+    top_logprobs: Option<&[Vec<common::llm_backend::TopLogprob>]>,
+    generated_token_ids: &[u32],
+) -> Option<Vec<RawTokenLogprob>> {
+    let lp = log_probs?;
+    let tlp = top_logprobs?;
+    // Defensive bounds — if the three slices desync (MTP /
+    // speculation mismatch, same class as the IndexError in
+    // handler_base._extract_logprobs), walk only the shortest.
+    let n = lp.len().min(tlp.len()).min(generated_token_ids.len());
+    if n == 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let position_top: Vec<RawTopLogprob> = tlp[i]
+            .iter()
+            .map(|t| RawTopLogprob {
+                token_id: t.token_id,
+                logprob: t.logprob as f32,
+            })
+            .collect();
+        out.push(RawTokenLogprob {
+            token_id: generated_token_ids[i],
+            logprob: lp[i] as f32,
+            top_logprobs: position_top,
+        });
+    }
+    Some(out)
 }
 
 pub struct DeltaGenerator {
@@ -310,6 +348,24 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
             }
         }
 
+        // Snapshot the engine's generated token IDs before `create_logprobs`
+        // consumes them. We need them later for the SMG-via-gRPC fallback that
+        // injects them into nvext.token_ids.
+        let generated_token_ids: Vec<u32> = delta.token_ids.clone();
+
+        // Build the SMG-via-gRPC raw-logprobs side channel. The OpenAI
+        // `Logprobs` shape that `create_logprobs` produces drops token_ids
+        // on `top_logprobs` alternatives — only the decoded strings
+        // remain. SMG's TrtllmService consumer needs token_ids to
+        // detokenize via its own tokenizer, so we snapshot the
+        // backend-side logprobs (with `token_id` preserved on every
+        // entry) here, before `create_logprobs` consumes the fields.
+        let raw_logprobs: Option<Vec<RawTokenLogprob>> = build_raw_logprobs(
+            delta.log_probs.as_deref(),
+            delta.top_logprobs.as_deref(),
+            &generated_token_ids,
+        );
+
         let logprobs = self.create_logprobs(
             delta.tokens,
             delta.token_ids,
@@ -326,11 +382,24 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
         // Get worker_id info from tracker (set by KvPushRouter based on phase)
         let worker_id_info = self.tracker.as_ref().and_then(|t| t.get_worker_info());
 
+        // Prefer GAIE Stage 2 disaggregated_params token_ids (the prompt
+        // echo for the prefill→decode handoff). When absent, fall back to
+        // the generated token IDs from the engine — external routers like
+        // SMG (driving us via TrtllmService gRPC) need raw token IDs to
+        // detokenize on their side. HTTP/OpenAI clients ignore unknown
+        // nvext fields, so this is additive.
         let token_ids = delta
             .disaggregated_params
             .as_ref()
             .and_then(|params| params.get("token_ids"))
-            .and_then(|v| serde_json::from_value::<Vec<u32>>(v.clone()).ok());
+            .and_then(|v| serde_json::from_value::<Vec<u32>>(v.clone()).ok())
+            .or_else(|| {
+                if !generated_token_ids.is_empty() {
+                    Some(generated_token_ids)
+                } else {
+                    None
+                }
+            });
         let routed_experts = delta
             .disaggregated_params
             .as_ref()
@@ -347,17 +416,20 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
             None
         };
 
-        // Inject nvext if we have worker_id, token_ids, timing, or routed experts.
+        // Inject nvext if we have worker_id, token_ids, timing, routed
+        // experts, or raw logprobs.
         if worker_id_info.is_some()
             || token_ids.is_some()
             || timing_info.is_some()
             || routed_experts.is_some()
+            || raw_logprobs.is_some()
         {
             let nvext_response = NvExtResponse {
                 worker_id: worker_id_info.clone(),
                 timing: timing_info,
                 token_ids: token_ids.clone(),
                 routed_experts,
+                raw_logprobs,
             };
 
             if let Ok(nvext_json) = serde_json::to_value(&nvext_response) {
@@ -403,5 +475,116 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
 
     fn tracker(&self) -> Option<std::sync::Arc<crate::protocols::common::timing::RequestTracker>> {
         self.tracker.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests pinning the SMG-via-gRPC fallback that surfaces the
+    //! engine's generated `delta.token_ids` into `NvExtResponse.token_ids`.
+    //!
+    //! Without these tests, regressions only surface in a 10-min cluster
+    //! round-trip (xp launch → Dynamo build → engine warmup → smoke client).
+    //! Local run: `cargo test -p dynamo-llm --lib --no-default-features
+    //!     protocols::openai::completions::delta::tests`.
+    use super::*;
+    use crate::protocols::common::llm_backend::BackendOutput;
+    use crate::protocols::openai::DeltaGeneratorExt as _;
+
+    fn fresh_generator() -> DeltaGenerator {
+        DeltaGenerator::new(
+            "test-model".to_string(),
+            DeltaGeneratorOptions::default(),
+            "test-req-id".to_string(),
+        )
+    }
+
+    fn backend_output_with_tokens(token_ids: Vec<u32>) -> BackendOutput {
+        BackendOutput {
+            token_ids,
+            tokens: vec![],
+            text: Some("ignored".to_string()),
+            cum_log_probs: None,
+            log_probs: None,
+            top_logprobs: None,
+            finish_reason: None,
+            stop_reason: None,
+            index: Some(0),
+            extra_args: None,
+            completion_usage: None,
+            disaggregated_params: None,
+        }
+    }
+
+    /// Pin: the SMG-via-gRPC fallback in `choice_from_postprocessor`.
+    /// When `delta.token_ids` is non-empty AND `disaggregated_params.token_ids`
+    /// is absent (the common case), the postprocessor must surface the
+    /// generated token IDs into `nvext.token_ids` on the response.
+    #[test]
+    fn choice_from_postprocessor_surfaces_generated_token_ids_to_nvext() {
+        let mut dgen = fresh_generator();
+        let backend = backend_output_with_tokens(vec![100, 200, 300]);
+        let resp = dgen
+            .choice_from_postprocessor(backend)
+            .expect("postprocessor succeeds");
+
+        let nvext = resp
+            .inner
+            .nvext
+            .as_ref()
+            .expect("nvext must be populated when token_ids present");
+        let token_ids = nvext
+            .get("token_ids")
+            .expect("token_ids field must exist in nvext");
+        let parsed: Vec<u32> = serde_json::from_value(token_ids.clone())
+            .expect("token_ids deserializes as Vec<u32>");
+        assert_eq!(parsed, vec![100u32, 200, 300]);
+    }
+
+    /// Pin: when `delta.token_ids` is empty (no generation yet, or annotation
+    /// frame), nvext should not be injected with a stale token_ids field.
+    #[test]
+    fn choice_from_postprocessor_skips_nvext_token_ids_when_no_generation() {
+        let mut dgen = fresh_generator();
+        let backend = backend_output_with_tokens(vec![]);
+        let resp = dgen
+            .choice_from_postprocessor(backend)
+            .expect("postprocessor succeeds");
+
+        // nvext may be None entirely, or it may exist for other reasons
+        // (worker_id, timing) but token_ids must not be populated.
+        if let Some(nvext) = resp.inner.nvext.as_ref() {
+            let has_token_ids = nvext
+                .get("token_ids")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            assert!(
+                !has_token_ids,
+                "token_ids must not be populated when delta has empty token_ids; got {nvext:?}"
+            );
+        }
+    }
+
+    /// Pin: GAIE Stage 2 disaggregated_params.token_ids takes precedence over
+    /// the engine-generated fallback. Pre-existing behavior we must not break.
+    #[test]
+    fn choice_from_postprocessor_prefers_disaggregated_params_token_ids() {
+        let mut dgen = fresh_generator();
+        let mut backend = backend_output_with_tokens(vec![999, 999, 999]);
+        backend.disaggregated_params = Some(serde_json::json!({
+            "token_ids": [1u32, 2u32, 3u32],
+        }));
+        let resp = dgen
+            .choice_from_postprocessor(backend)
+            .expect("postprocessor succeeds");
+
+        let nvext = resp.inner.nvext.as_ref().expect("nvext populated");
+        let token_ids = nvext.get("token_ids").expect("token_ids set");
+        let parsed: Vec<u32> = serde_json::from_value(token_ids.clone()).unwrap();
+        assert_eq!(
+            parsed,
+            vec![1u32, 2, 3],
+            "disaggregated_params.token_ids must win over delta.token_ids"
+        );
     }
 }

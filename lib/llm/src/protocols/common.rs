@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::TokenIdType;
+use super::openai::common_ext::MessageHashEntry;
 
 /// Maximum nesting depth allowed in guided_grammar EBNF strings.
 const MAX_GRAMMAR_NESTING_DEPTH: usize = 500;
@@ -186,6 +187,14 @@ pub struct CompletionRequest {
     /// User requested annotations for the request
     #[builder(default)]
     pub annotations: Option<Vec<String>>,
+
+    /// Per-message content hashes for session reconstruction (set by SMG
+    /// via `--enable-message-hash`). Forwarded verbatim from
+    /// `CommonExt.message_hashes` on the inbound request to the worker so
+    /// it can pass `message_hashes=...` into the TRT engine; TRT records
+    /// them in `RequestStatistics.message_hashes`.
+    #[builder(default)]
+    pub message_hashes: Option<Vec<MessageHashEntry>>,
 }
 
 impl CompletionRequest {
@@ -555,6 +564,20 @@ pub struct OutputOptions {
     /// the tokenizer. This is useful for inspecting the behavior of prompt
     /// templates that are applied during the backend preprocessing.
     pub formatted_prompt: Option<bool>,
+
+    /// If true, the Backend operator skips per-token detokenization (and
+    /// the stop-string matching that depends on it). Output frames carry
+    /// raw `token_ids` only; `.text` stays empty.
+    ///
+    /// Set by the SMG-fronting gRPC servicer (lib/llm/src/grpc/service/
+    /// trtllm.rs) on every request, since SMG owns detokenization and
+    /// tool-call parsing on its side. Without this we run HF's
+    /// `decode_stream.step()` per token in Dynamo AND again in SMG —
+    /// wasted work measurable in the −17% gen tok/s gap on Kimi MN.
+    ///
+    /// Callers that set this MUST handle stop conditions themselves;
+    /// SMG's `create_stop_decoder` does that on its side.
+    pub skip_detokenization: Option<bool>,
 }
 
 // Struct for log probability information

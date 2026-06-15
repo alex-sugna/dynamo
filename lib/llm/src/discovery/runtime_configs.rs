@@ -46,14 +46,22 @@ pub async fn runtime_config_watch(endpoint: &Endpoint) -> anyhow::Result<Runtime
         watch_and_extract_field(stream, |card: ModelDeploymentCard| card.runtime_config);
 
     let (tx, rx) = watch::channel(HashMap::new());
+    let eid_for_log = eid.clone();
 
     tokio::spawn(async move {
+        let mut last_count: Option<usize> = None;
         loop {
-            tokio::select! {
+            let wake_source = tokio::select! {
                 _ = cancel_token.cancelled() => break,
-                result = instance_ids_rx.changed() => { if result.is_err() { break; } }
-                result = configs_rx.changed() => { if result.is_err() { break; } }
-            }
+                result = instance_ids_rx.changed() => {
+                    if result.is_err() { break; }
+                    "instance_avail"
+                }
+                result = configs_rx.changed() => {
+                    if result.is_err() { break; }
+                    "configs"
+                }
+            };
 
             let instances: HashSet<WorkerId> = instance_ids_rx
                 .borrow_and_update()
@@ -72,6 +80,17 @@ pub async fn runtime_config_watch(endpoint: &Endpoint) -> anyhow::Result<Runtime
             if *tx.borrow() == ready {
                 continue;
             }
+
+            // Log the recomputation so we can verify at runtime that the join
+            // wakes on report_instance_down (it didn't, pre-shared-avail-fix).
+            tracing::info!(
+                endpoint = ?eid_for_log,
+                wake_source,
+                count = ready.len(),
+                prev_count = ?last_count,
+                "[runtime_config_watch] joined map changed"
+            );
+            last_count = Some(ready.len());
 
             // Break if all receivers dropped (e.g., TOCTOU in model_manager discards a duplicate).
             if tx.send(ready).is_err() {

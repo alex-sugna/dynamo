@@ -55,6 +55,7 @@ use crate::protocols::{
         chat_completions::{
             NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse, jail::JailedStream,
         },
+        common_ext::CommonExtProvider,
         completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
         embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
         nvext::NvExtProvider,
@@ -173,6 +174,13 @@ pub struct OpenAIPreprocessor {
     media_loader: Option<MediaLoader>,
     /// Max context length (in tokens) this model can handle, from ModelDeploymentCard
     context_length: u32,
+    /// Mirror of TRT-LLM's `clamp_max_tokens_on_arrival` (commit 71b2bce):
+    /// when set, requests where `prompt_tokens + max_tokens > max_seq_len`
+    /// are clamped (`max_tokens = max_seq_len - prompt_tokens`) instead of
+    /// being rejected at the validation step in `validate_token_count`.
+    /// Off → existing 400 behavior preserved verbatim. Sourced from env
+    /// `DYN_CLAMP_MAX_TOKENS_ON_ARRIVAL` ("1"/"true" enable).
+    clamp_max_tokens_on_arrival: bool,
 }
 
 impl OpenAIPreprocessor {
@@ -227,6 +235,10 @@ impl OpenAIPreprocessor {
         };
 
         let context_length = mdc.context_length;
+        let clamp_max_tokens_on_arrival = std::env::var("DYN_CLAMP_MAX_TOKENS_ON_ARRIVAL")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         Ok(Arc::new(Self {
             formatter,
@@ -239,6 +251,7 @@ impl OpenAIPreprocessor {
             tool_call_parser,
             media_loader,
             context_length,
+            clamp_max_tokens_on_arrival,
         }))
     }
     /// Encode a string to it's tokens
@@ -258,7 +271,8 @@ impl OpenAIPreprocessor {
             + SamplingOptionsProvider
             + StopConditionsProvider
             + OutputOptionsProvider
-            + NvExtProvider,
+            + NvExtProvider
+            + CommonExtProvider,
     >(
         &self,
         request: &R,
@@ -284,7 +298,8 @@ impl OpenAIPreprocessor {
             + SamplingOptionsProvider
             + StopConditionsProvider
             + OutputOptionsProvider
-            + NvExtProvider,
+            + NvExtProvider
+            + CommonExtProvider,
     >(
         &self,
         request: &R,
@@ -315,6 +330,17 @@ impl OpenAIPreprocessor {
         builder.output_options(request.extract_output_options()?);
         builder.annotations(request.annotations().unwrap_or_default());
         builder.mdc_sum(Some(self.mdcsum.clone()));
+
+        // Forward per-message hashes from CommonExt onto the preprocessed
+        // request. The worker reads `request["message_hashes"]` and passes
+        // it as a `message_hashes=...` kwarg to `engine.llm.generate_async`
+        // so TRT records them in `RequestStatistics.message_hashes` (the
+        // `statistics={..., message_hashes=[...]}` engine log line).
+        if let Some(common) = request.common_ext() {
+            if let Some(hashes) = common.message_hashes.clone() {
+                builder.message_hashes(Some(hashes));
+            }
+        }
         let lora_name = self.lora_name.clone();
 
         // Extract routing hints from nvext if present
@@ -331,9 +357,27 @@ impl OpenAIPreprocessor {
                 priority: hints.and_then(|h| h.priority),
                 lora_name,
                 allowed_worker_ids: None,
+                partition_group: None,
             };
             builder.routing(Some(routing));
             builder.decode_instance_id(nvext.decode_instance_id);
+            // [pin_trace:2/preprocessor] Confirms nvext fields were mapped
+            // into PreprocessedRequest. If `nvext_decode_instance_id` is Some
+            // here but downstream logs show decode_instance_id=None, the loss
+            // is between Preprocessor and Migration (very unlikely; this is
+            // the smoking-gun checkpoint to rule out a serde / cloning issue).
+            tracing::info!(
+                target: "dynamo::pin_trace",
+                client_request_id = ?nvext.annotations.as_ref()
+                    .and_then(|a| a.iter()
+                        .find_map(|s| s.strip_prefix("request_id="))
+                        .map(|s| s.to_string())),
+                nvext_backend_instance_id = ?nvext.backend_instance_id,
+                nvext_decode_instance_id = ?nvext.decode_instance_id,
+                preproc_backend_instance_id = ?nvext.backend_instance_id,
+                preproc_decode_instance_id = ?nvext.decode_instance_id,
+                "[pin_trace:2/preprocessor] nvext → PreprocessedRequest"
+            );
         } else if lora_name.is_some() {
             // Ensure LoRA-aware routing still gets hints even when nvext is absent.
             builder.routing(Some(RoutingHints {
@@ -389,6 +433,31 @@ impl OpenAIPreprocessor {
         let mut media_map: MultimodalDataMap = HashMap::new();
         let mut fetch_tasks: Vec<(String, ChatCompletionRequestUserMessageContentPart)> =
             Vec::new();
+
+        // Completions path: gRPC handler (proto_to_completion_request) packed
+        // SMG-provided image bytes into request.multi_modal_data as
+        // `data:image/jpeg;base64,...` data URLs. Forward them directly into
+        // the PreprocessedRequest's media_map — the Python worker's
+        // multimodal_processor.process_openai_request reads from there.
+        // Without this branch the field is silently dropped because the
+        // typed_messages() fallback below is None for non-chat requests.
+        if let Some(pre_mm) = request.preexisting_multi_modal_data() {
+            use crate::protocols::openai::completions::MultiModalImageItem;
+            let bucket = media_map
+                .entry("image_url".to_string())
+                .or_default();
+            for item in &pre_mm.image_url {
+                let MultiModalImageItem::Url(url) = item;
+                // RawUrl serializes as {"Url": "<string>"} (see
+                // protocols/common/preprocessor.rs:106), matching the
+                // Python worker's URL_VARIANT_KEY = "Url" lookup.
+                bucket.push(MultimodalData::RawUrl(url.clone()));
+            }
+            if !media_map.is_empty() {
+                builder.multi_modal_data(Some(media_map));
+            }
+            return Ok(());
+        }
 
         let Some(messages) = request.typed_messages() else {
             return Ok(());
@@ -580,12 +649,38 @@ impl OpenAIPreprocessor {
             }
         }
 
-        // Validate prompt token count (and prompt + max_tokens) against model's context length
+        // Validate prompt token count (and prompt + max_tokens) against model's context length.
+        // When clamp_max_tokens_on_arrival is enabled, the overflow path returns a clamped
+        // max_tokens value instead of an Err — we then re-set stop_conditions on the builder.
         if let Some(count) = token_count {
-            let max_tokens = request.extract_stop_conditions()
-                .ok()
-                .and_then(|sc| sc.max_tokens);
-            Self::validate_token_count(count, self.context_length, max_tokens)?;
+            let original_sc = request.extract_stop_conditions().ok();
+            let max_tokens = original_sc.as_ref().and_then(|sc| sc.max_tokens);
+            if let Some(clamped) = Self::validate_token_count(
+                count,
+                self.context_length,
+                max_tokens,
+                self.clamp_max_tokens_on_arrival,
+            )? {
+                // Mirror TRT-LLM commit 71b2bce: clamp max_tokens to
+                // (max_seq_len - prompt_tokens) and continue. Direct builder
+                // field mutation isn't available (derive_builder field is
+                // private), so re-extract + re-apply the eos/ignore_eos
+                // logic from `builder()` + set the clamped max_tokens. The
+                // eos work is idempotent — same model_info, same request.
+                let mut sc = original_sc.unwrap_or(request.extract_stop_conditions()?);
+                sc.max_tokens = Some(clamped);
+                if let Some(stop_tokens) = &mut sc.stop_token_ids_hidden {
+                    for eos_token in self.model_info.eos_token_ids() {
+                        if !stop_tokens.contains(&eos_token) {
+                            stop_tokens.push(eos_token);
+                        }
+                    }
+                } else {
+                    sc.stop_token_ids_hidden = Some(self.model_info.eos_token_ids());
+                }
+                sc.apply_ignore_eos();
+                builder.stop_conditions(sc);
+            }
         }
 
         Ok(annotations)
@@ -593,28 +688,40 @@ impl OpenAIPreprocessor {
 
     /// Validate that the prompt token count does not consume the model's entire context length,
     /// and that the combined prompt + requested output does not exceed it.
+    ///
+    /// Returns `Ok(None)` when the request passes as-is, `Ok(Some(clamped))` when the
+    /// clamp opt-in fires and `max_tokens` should be reduced to `clamped` (= max_seq_len -
+    /// prompt_tokens, exactly mirroring TRT-LLM commit 71b2bce), and `Err` for the two
+    /// hard-reject cases (prompt alone fills the window; prompt+max_tokens overflows
+    /// with clamp disabled).
     fn validate_token_count(
         token_count: usize,
         context_length: u32,
         max_tokens: Option<u32>,
-    ) -> Result<()> {
+        clamp_max_tokens_on_arrival: bool,
+    ) -> Result<Option<u32>> {
         let max_len = context_length as usize;
         // max_len == 0 means context_length was not configured (model_card.rs defaults
         // to 0 when max_position_embeddings is absent), so skip validation.
         if max_len == 0 {
-            return Ok(());
+            return Ok(None);
         }
 
         // Use >= because context_length is the total budget (input + output): if the
-        // prompt alone fills it, there is zero room for output tokens.
+        // prompt alone fills it, there is zero room for output tokens. This also
+        // covers the "clamp clips to <= 0" case (token_count == max_len) — the
+        // clamp branch below requires token_count < max_len to compute a positive
+        // clamped value, so falling through here means the clamp had nothing to give.
+        //
+        // Error message is byte-for-byte identical to TRT-LLM's InvalidRequestError
+        // at tensorrt_llm/llmapi/llm.py:806 (commit 28d2a499) so clients that
+        // string-match on it work regardless of which layer enforced the limit.
         if token_count >= max_len {
             return Err(DynamoError::builder()
                 .error_type(ErrorType::InvalidArgument)
                 .message(format!(
-                    "This model's maximum context length is {} tokens. \
-                     However, your messages resulted in {} tokens. \
-                     Please reduce the length of the messages.",
-                    max_len, token_count,
+                    "The input token count ({}) exceeds the model's maximum context length ({})",
+                    token_count, max_len,
                 ))
                 .build()
                 .into());
@@ -623,10 +730,20 @@ impl OpenAIPreprocessor {
         if let Some(max_output_tokens) = max_tokens {
             let total_tokens = token_count + max_output_tokens as usize;
             if total_tokens > max_len + 1 {
+                if clamp_max_tokens_on_arrival {
+                    // TRT-LLM parity (commit 28d2a499): clamped = max_seq_len - prompt_tokens.
+                    // token_count < max_len is guaranteed by the check above, so the
+                    // subtraction is positive — safe to cast back to u32.
+                    return Ok(Some((max_len - token_count) as u32));
+                }
+                // Matches TRT-LLM's tensorrt_llm/llmapi/llm.py:822-825 exactly
+                // (same word order, "plus the requested output count", single space
+                // before "exceeds"). Clients use this message verbatim to disambiguate
+                // case-1 vs case-2 — keep the wording stable.
                 return Err(DynamoError::builder()
                     .error_type(ErrorType::InvalidArgument)
                     .message(format!(
-                        "The input token count ({}) and the requested output count ({}) exceeds the model's maximum context length ({})",
+                        "The input token count ({}) plus the requested output count ({}) exceeds the model's maximum context length ({})",
                         token_count, max_output_tokens, max_len,
                     ))
                     .build()
@@ -634,7 +751,7 @@ impl OpenAIPreprocessor {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn encode_with_timing(
@@ -1480,6 +1597,39 @@ impl
 
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;
+
+        // Inject request_id into extra_args so handler_base.py (both prefill
+        // and decode TRT workers — they read the same PreprocessedRequest)
+        // can log it. The gRPC TrtllmService handler stuffs request_id into
+        // nvext.annotations as "request_id=X" (see grpc/service/trtllm.rs);
+        // we extract here and surface as a first-class extra_args entry
+        // which is what handler_base.py looks at. Without this, the entire
+        // SMG → dynamo → TRT request_id chain breaks despite each layer
+        // having the value — and worker logs read `request_id=None` on
+        // every request, which makes ANY cross-layer debugging impossible.
+        let request_id_from_nvext = request
+            .nvext
+            .as_ref()
+            .and_then(|nv| nv.annotations.as_ref())
+            .and_then(|anns| {
+                anns.iter()
+                    .find_map(|a| a.strip_prefix("request_id=").map(|s| s.to_string()))
+            });
+        if let Some(req_id) = request_id_from_nvext {
+            let mut extra_args = common_request
+                .extra_args
+                .take()
+                .and_then(|v| {
+                    if let serde_json::Value::Object(m) = v {
+                        Some(m)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            extra_args.insert("request_id".to_string(), serde_json::Value::String(req_id));
+            common_request.extra_args = Some(serde_json::Value::Object(extra_args));
+        }
 
         // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
         if common_request.prompt_embeds.is_none() {

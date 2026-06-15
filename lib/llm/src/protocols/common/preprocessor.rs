@@ -60,6 +60,13 @@ pub struct RoutingHints {
     /// When set, only workers in this set are considered during scoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
+
+    /// Optional partition label restricting routing to workers whose
+    /// ModelRuntimeConfig.partition_group matches. Stamped by prefill_router
+    /// on the decode handoff so decode picks stay in the same partition as
+    /// the picked prefill (blast-radius isolation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_group: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -191,6 +198,15 @@ pub struct PreprocessedRequest {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_args: Option<serde_json::Value>,
+
+    /// Per-message content hashes attached by SMG (`--enable-message-hash`)
+    /// for session reconstruction. Forwarded verbatim from `CommonExt.
+    /// message_hashes` on the inbound request to the worker so it can
+    /// pass `message_hashes=...` into the TRT engine; TRT records them
+    /// in `RequestStatistics.message_hashes`.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_hashes: Option<Vec<super::super::openai::common_ext::MessageHashEntry>>,
 
     /// Optional request tracker for per-request metrics (shared with DeltaGenerator)
     #[builder(default)]

@@ -194,6 +194,10 @@ impl LocalModelBuilder {
 
     pub fn runtime_config(&mut self, runtime_config: ModelRuntimeConfig) -> &mut Self {
         self.runtime_config = runtime_config;
+        // Pick up DYN_PARTITION_GROUP from env on every worker that uses this builder,
+        // so partition labels surface on registration without requiring per-engine plumbing.
+        // No-op if env unset or the caller already set partition_group explicitly.
+        self.runtime_config.fill_partition_group_from_env();
         self
     }
 
@@ -222,6 +226,10 @@ impl LocalModelBuilder {
     /// - A folder: The last part of the folder name: "/data/llms/Qwen2.5-3B-Instruct" -> "Qwen2.5-3B-Instruct"
     /// - An HF repo: The HF repo name: "Qwen/Qwen3-0.6B" stays the same
     pub async fn build(&mut self) -> anyhow::Result<LocalModel> {
+        // Pick up DYN_PARTITION_GROUP from env even when the caller never invokes
+        // .runtime_config() explicitly (default builder path).
+        self.runtime_config.fill_partition_group_from_env();
+
         // Generate an endpoint ID for this model if the user didn't provide one.
         // The user only provides one if exposing the model.
         let endpoint_id = self

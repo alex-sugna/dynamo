@@ -40,8 +40,15 @@ pub struct State {
     flags: StateFlags,
     cancel_token: CancellationToken,
     /// Timestamp of the last successful user request (e.g., chat completion).
-    /// Used by the frontend e2e health check to skip probes when traffic is active.
-    last_successful_request: std::sync::RwLock<Option<std::time::Instant>>,
+    /// Used by the frontend e2e health check to skip probes when traffic is
+    /// active. Stamped only by `RequestLogScope::drop` when the request
+    /// actually reached status=200 with osl>0 — degraded "200 with empty
+    /// body" completions must never poison this timer (see 2026-05-14
+    /// outage where the bypass kept `/health/frontend` returning 200 for
+    /// 9h while disagg was broken). Shared as `Arc<RwLock<...>>` so
+    /// per-request scopes can stamp it directly without going through
+    /// the state object.
+    last_successful_request: crate::observability::LastSuccessfulRequestHandle,
 }
 
 #[derive(Default, Debug)]
@@ -121,7 +128,7 @@ impl State {
                 anthropic_endpoints_enabled: AtomicBool::new(false),
             },
             cancel_token,
-            last_successful_request: std::sync::RwLock::new(None),
+            last_successful_request: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -157,17 +164,22 @@ impl State {
         None
     }
 
-    /// Record a successful user request completion (e.g., chat completion returned 200).
-    pub fn record_successful_request(&self) {
-        *self.last_successful_request.write().unwrap() = Some(std::time::Instant::now());
-    }
-
     /// Get the elapsed time since the last successful user request, if any.
     pub fn last_successful_request_age(&self) -> Option<std::time::Duration> {
         self.last_successful_request
             .read()
             .unwrap()
             .map(|t| t.elapsed())
+    }
+
+    /// Get a clone of the shared handle so per-request log scopes can
+    /// stamp it directly from their `Drop` impl. The stamp is gated on
+    /// status=200 + osl>0 + !is_health_check in the scope's `Drop` —
+    /// see [`crate::observability::RequestLogScope`].
+    pub fn last_successful_request_handle(
+        &self,
+    ) -> crate::observability::LastSuccessfulRequestHandle {
+        self.last_successful_request.clone()
     }
 }
 

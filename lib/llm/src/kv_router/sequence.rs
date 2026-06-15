@@ -8,7 +8,7 @@
 //! to NATS event transport and Prometheus metrics.
 
 pub use dynamo_kv_router::multi_worker_sequence::{
-    ActiveSequencesMultiWorker, SequenceError, SequencePublisher, SequenceRequest,
+    ActiveSequencesMultiWorker, IndexerHandle, SequenceError, SequencePublisher, SequenceRequest,
     SequenceSubscriber,
 };
 pub use dynamo_kv_router::sequence::{ActiveSequences, RequestId};
@@ -92,6 +92,7 @@ pub async fn create_multi_worker_sequences(
     replica_sync: bool,
     router_id: u64,
     worker_type: &'static str,
+    indexer_handle: Option<Arc<dyn IndexerHandle>>,
 ) -> Result<Arc<ActiveSequencesMulti>> {
     let event_publisher =
         EventPublisher::for_component(&component, ACTIVE_SEQUENCES_SUBJECT).await?;
@@ -113,13 +114,14 @@ pub async fn create_multi_worker_sequences(
         })
         .collect();
 
-    let multi_worker = ActiveSequencesMultiWorker::new(
+    let multi_worker = ActiveSequencesMultiWorker::new_with_indexer(
         publisher,
         block_size,
         &dp_range,
         replica_sync,
         router_id,
         worker_type,
+        indexer_handle,
     );
 
     let arc = Arc::new(multi_worker);
@@ -200,6 +202,7 @@ mod tests {
             true,
             1,
             crate::discovery::WORKER_TYPE_DECODE,
+            None,
         )
         .await?;
         let seq_manager_2 = create_multi_worker_sequences(
@@ -209,6 +212,7 @@ mod tests {
             true,
             2,
             crate::discovery::WORKER_TYPE_DECODE,
+            None,
         )
         .await?;
 
@@ -218,6 +222,7 @@ mod tests {
             .add_request(SequenceRequest {
                 request_id: "request_0".to_string(),
                 token_sequence: Some(vec![0, 1, 2]),
+                local_hashes: None,
                 isl: 12,
                 overlap: 0,
                 expected_output_tokens: None,
@@ -230,6 +235,7 @@ mod tests {
             .add_request(SequenceRequest {
                 request_id: "request_1".to_string(),
                 token_sequence: Some(vec![3, 4]),
+                local_hashes: None,
                 isl: 8,
                 overlap: 0,
                 expected_output_tokens: None,
@@ -242,6 +248,7 @@ mod tests {
             .add_request(SequenceRequest {
                 request_id: "request_2".to_string(),
                 token_sequence: Some(vec![0, 1, 2, 3]),
+                local_hashes: None,
                 isl: 16,
                 overlap: 0,
                 expected_output_tokens: None,
@@ -350,6 +357,7 @@ mod tests {
             true,
             1,
             crate::discovery::WORKER_TYPE_DECODE,
+            None,
         )
         .await?;
         let seq_manager_2 = create_multi_worker_sequences(
@@ -359,6 +367,7 @@ mod tests {
             true,
             2,
             crate::discovery::WORKER_TYPE_DECODE,
+            None,
         )
         .await?;
 
@@ -368,6 +377,7 @@ mod tests {
             .add_request(SequenceRequest {
                 request_id: "request_0".to_string(),
                 token_sequence: None,
+                local_hashes: None,
                 isl: 12,
                 overlap: 0,
                 expected_output_tokens: None,
@@ -380,6 +390,7 @@ mod tests {
             .add_request(SequenceRequest {
                 request_id: "request_1".to_string(),
                 token_sequence: None,
+                local_hashes: None,
                 isl: 8,
                 overlap: 0,
                 expected_output_tokens: None,
@@ -392,6 +403,7 @@ mod tests {
             .add_request(SequenceRequest {
                 request_id: "request_2".to_string(),
                 token_sequence: None,
+                local_hashes: None,
                 isl: 16,
                 overlap: 0,
                 expected_output_tokens: None,

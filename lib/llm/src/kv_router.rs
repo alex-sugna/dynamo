@@ -63,6 +63,9 @@ use crate::{
     local_model::runtime_config::ModelRuntimeConfig,
 };
 
+use dynamo_kv_router::multi_worker_sequence::IndexerHandle;
+use dynamo_tokens::SequenceHash;
+
 use std::collections::HashSet;
 
 // [gluo TODO] shouldn't need to be public
@@ -276,6 +279,42 @@ impl Indexer {
             Indexer::None => Vec::new(),
         }
     }
+
+    /// Returns an `Arc<dyn IndexerHandle>` for plumbing into the multi-worker
+    /// sequence tracker so the replica-sync receiver can update the local
+    /// radix tree. Returns `None` for `Indexer::None` or for backends that
+    /// don't support routing-decision updates (i.e. `Indexer::Concurrent`,
+    /// which has no pruning/routing-decision channel).
+    pub(crate) fn as_indexer_handle(&self) -> Option<Arc<dyn IndexerHandle>> {
+        match self {
+            Indexer::KvIndexer(indexer) => Some(Arc::new(KvIndexerHandle(indexer.clone()))),
+            Indexer::Concurrent(_) => None,
+            Indexer::None => None,
+        }
+    }
+}
+
+/// Adapter wrapping `KvIndexer` so it can be passed across the
+/// `kv-router` / `lib/llm` crate boundary as an `Arc<dyn IndexerHandle>`.
+/// Cheap to clone — `KvIndexer` is already `Clone` and holds Arcs internally.
+struct KvIndexerHandle(KvIndexer);
+
+#[async_trait::async_trait]
+impl IndexerHandle for KvIndexerHandle {
+    async fn apply_routing_decision_with_hashes(
+        &self,
+        worker: WorkerWithDpRank,
+        local_hashes: Vec<LocalBlockHash>,
+        sequence_hashes: Vec<SequenceHash>,
+    ) {
+        if let Err(e) = self
+            .0
+            .apply_routing_decision_with_hashes(worker, local_hashes, sequence_hashes)
+            .await
+        {
+            tracing::warn!(error = ?e, "replica-sync: failed to feed routing decision into local indexer");
+        }
+    }
 }
 
 /// A KvRouter only decides which worker you should use. It doesn't send you there.
@@ -321,6 +360,7 @@ impl KvRouter {
             selector,
             &kv_router_config,
             worker_type,
+            indexer.as_indexer_handle(),
         )
         .await?;
 
@@ -376,6 +416,7 @@ impl KvRouter {
         lora_name: Option<String>,
         priority_jump: f64,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
+        partition_group: Option<String>,
     ) -> anyhow::Result<(WorkerWithDpRank, u32)> {
         let start = Instant::now();
 
@@ -397,7 +438,7 @@ impl KvRouter {
 
         let overlap_scores = self
             .indexer
-            .find_matches(block_hashes)
+            .find_matches(block_hashes.clone())
             .instrument(tracing::info_span!("kv_router.find_matches"))
             .await?;
         let find_matches_elapsed = start.elapsed();
@@ -413,18 +454,31 @@ impl KvRouter {
         });
         let seq_hash_elapsed = start.elapsed();
 
+        // Ship `local_hashes` for the replica-sync radix-tree extension
+        // unconditionally — independent of `router_track_active_blocks`,
+        // which is FALSE on the prefill router (watcher.rs:497) but we
+        // still want peer routers to learn about the prefill's routing.
+        // Receiver derives seq_hashes from local_hashes when needed.
+        let maybe_local_hashes = if block_hashes.is_empty() {
+            None
+        } else {
+            Some(block_hashes)
+        };
+
         let response = self
             .scheduler
             .schedule(
                 context_id.map(|s| s.to_string()),
                 isl_tokens,
                 maybe_seq_hashes,
+                maybe_local_hashes,
                 overlap_scores,
                 router_config_override,
                 update_states,
                 lora_name,
                 priority_jump,
                 allowed_worker_ids,
+                partition_group,
             )
             .instrument(tracing::info_span!("kv_router.schedule"))
             .await?;
@@ -473,11 +527,23 @@ impl KvRouter {
             lora_name.as_deref(),
         );
 
+        // Mirror find_best_match: ship local_hashes unconditionally for
+        // the replica-sync radix-tree extension. (router_track_active_blocks
+        // is FALSE on the prefill router, so we can't gate on seq_hashes.)
+        let block_hashes =
+            compute_block_hash_for_seq(tokens, self.block_size, None, lora_name.as_deref());
+        let maybe_local_hashes = if block_hashes.is_empty() {
+            None
+        } else {
+            Some(block_hashes)
+        };
+
         if let Err(e) = self
             .scheduler
             .add_request(SequenceRequest {
                 request_id: request_id.clone(),
                 token_sequence: maybe_seq_hashes,
+                local_hashes: maybe_local_hashes,
                 isl: isl_tokens,
                 overlap: overlap_blocks,
                 expected_output_tokens,
@@ -583,6 +649,7 @@ impl AsyncEngine<SingleIn<RouterRequest>, ManyOut<Annotated<RouterResponse>>, Er
                         true,
                         None,
                         0.0,
+                        None,
                         None,
                     )
                     .await?;

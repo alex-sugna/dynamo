@@ -30,7 +30,75 @@ fn is_migratable(err: &(dyn StdError + 'static)) -> bool {
     const NON_MIGRATABLE: &[ErrorType] = &[
         // Future: ErrorType::Cancelled, ErrorType::ValidationError, etc.
     ];
-    error::match_error_chain(err, MIGRATABLE, NON_MIGRATABLE)
+    if error::match_error_chain(err, MIGRATABLE, NON_MIGRATABLE) {
+        return true;
+    }
+
+    // Migrate on two `KvSchedulerError` variants reachable on the decode-
+    // side scheduler post-prefill:
+    //
+    //   * `NoEndpoints` — a decode worker is briefly absent from
+    //     `RuntimeConfigWatch` (push_router `report_instance_down` from a
+    //     stall, or a watch reconnect blip). The retry re-runs PrefillRouter
+    //     → `compute_allowed_prefills` sees a smaller `live_partitions` set,
+    //     excludes the dead partition, and routes through a different one.
+    //
+    //   * `AdmissionRejected` — a decode worker passed the prefill admit
+    //     check, but by the time the request reaches the decode-side
+    //     scheduler some decodes in the partition have filled (race between
+    //     prefill execution and decode dispatch, ~prefill_latency seconds).
+    //     The retry re-runs PrefillRouter and the per-role admission filter,
+    //     which now picks a different partition with capacity. If the cluster
+    //     is genuinely saturated everywhere, the retry will hit
+    //     AdmissionRejected again at the prefill_router level and bubble out
+    //     as 429 after `migration_limit` attempts — that's the intended
+    //     terminal 429 path. We bound waste by `migration_limit` (currently
+    //     2 → 3 attempts).
+    //
+    // NOTE: we make AdmissionRejected migratable globally rather than only
+    // distinguishing "decode-side AdmissionRejected" from "prefill-router-
+    // level AdmissionRejected" — the migration retry budget bounds the cost
+    // of mis-treating a fleet-wide saturation as decode-local, and the
+    // prefill_router admission rerun on retry sees the same fleet state and
+    // fast-fails the same way. Net effect is identical to the typed split,
+    // simpler code.
+    // Typed downcast only — intentional. The chain structure asymmetry
+    // between prefill-side and decode-side rejections is the load-bearing
+    // distinction:
+    //
+    //   * Decode-side: `KvSchedulerError` reaches here NOT wrapped by
+    //     `PrefillError`, so the typed downcast finds it. Variants
+    //     `NoEndpoints` + `AdmissionRejected` are migratable — a different
+    //     partition's decode may have capacity.
+    //   * Prefill-side: `KvSchedulerError` is boxed inside `PrefillError::
+    //     PrefillError(String, Box<dyn Error>(anyhow::Error))`, and the
+    //     boxed anyhow::Error's trait-object concrete type erases the
+    //     inner KvSchedulerError from typed downcast. Walk hits anyhow's
+    //     trait-object layer and stops. is_migratable returns false →
+    //     non-migratable → bubbles out as terminal 429 via
+    //     `grpc/service/openai.rs::classify_setup_error`'s substring
+    //     fallback. This is correct: prefill-side saturation is fleet-
+    //     wide; immediate retry would hit the same fleet state.
+    //
+    // If the wrapping ever changes (e.g. PrefillError grows a typed
+    // `Admission(KvSchedulerError)` variant), update this comment + the
+    // companion classify_setup_error to keep the two paths in sync.
+    let mut current: Option<&(dyn StdError + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(kse) =
+            e.downcast_ref::<crate::kv_router::scheduler::KvSchedulerError>()
+        {
+            if matches!(
+                kse,
+                crate::kv_router::scheduler::KvSchedulerError::NoEndpoints
+                    | crate::kv_router::scheduler::KvSchedulerError::AdmissionRejected { .. }
+            ) {
+                return true;
+            }
+        }
+        current = e.source();
+    }
+    false
 }
 
 pub struct Migration {
@@ -75,6 +143,28 @@ impl
         let (preprocessed_request, context) = request.transfer(());
         let engine_ctx = context.context();
         let engine_ctx_ = engine_ctx.clone();
+        // [pin_trace:3/migration] Cross-link the internal UUID (`request_id`)
+        // with the chatcmpl-* (`client_request_id`) that came in via gRPC
+        // annotations. This is the bridge log: every downstream frontend log
+        // uses request_id=UUID, but the decode worker logs request_id=chatcmpl-*.
+        // To trace one probe end-to-end, find its chatcmpl_id here, then grep
+        // both IDs across frontend + decode logs.
+        let client_request_id: Option<String> = preprocessed_request
+            .annotations
+            .iter()
+            .find_map(|s| s.strip_prefix("request_id=").map(|x| x.to_string()));
+        tracing::info!(
+            target: "dynamo::pin_trace",
+            request_id = %engine_ctx_.id(),
+            client_request_id = ?client_request_id,
+            model = %self.model_name,
+            migration_limit = self.migration_limit,
+            routing_prefill_worker_id = ?preprocessed_request.routing.as_ref().and_then(|r| r.prefill_worker_id),
+            routing_decode_worker_id = ?preprocessed_request.routing.as_ref().and_then(|r| r.decode_worker_id),
+            routing_backend_instance_id = ?preprocessed_request.routing.as_ref().and_then(|r| r.backend_instance_id),
+            decode_instance_id = ?preprocessed_request.decode_instance_id,
+            "[pin_trace:3/migration] enter Migration::generate"
+        );
         let retry_manager = RetryManager::build(
             engine_ctx,
             preprocessed_request,
@@ -101,6 +191,11 @@ struct RetryManager {
     next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>>,
     next_stream: Option<ManyOut<Annotated<BackendOutput>>>,
     retries_left: u32,
+    /// Cumulative retries fired across this request's lifecycle. Used by the
+    /// `[migration_summary]` log emitted whenever new_stream() recovers a
+    /// request that needed at least one retry. Persists across multiple
+    /// new_stream() invocations (initial attempt + mid-stream retries).
+    retries_used: u32,
     model_name: Arc<String>,
     metrics: Arc<Metrics>,
 }
@@ -114,12 +209,56 @@ impl RetryManager {
         model_name: Arc<String>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
+        // If the caller pinned a specific worker (via routing.prefill_worker_id /
+        // decode_worker_id / backend_instance_id, or top-level decode_instance_id),
+        // their intent is "use exactly this worker." Migration retry would clear
+        // the pin and re-pick a different worker — silently overriding the
+        // targeting and (critically) making the e2e health probe pass even when
+        // the targeted worker is dead. Force retries=0 for pinned requests so the
+        // initial attempt is the only attempt and failures surface to the caller.
+        let pinned_field = preprocessed_request
+            .routing
+            .as_ref()
+            .and_then(|r| {
+                if r.prefill_worker_id.is_some() {
+                    Some("routing.prefill_worker_id")
+                } else if r.decode_worker_id.is_some() {
+                    Some("routing.decode_worker_id")
+                } else if r.backend_instance_id.is_some() {
+                    Some("routing.backend_instance_id")
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                preprocessed_request
+                    .decode_instance_id
+                    .map(|_| "request.decode_instance_id")
+            });
+        let effective_retries = match pinned_field {
+            Some(field) => {
+                // Always log when we see a pin, even when requested_retries was
+                // already 0 — this confirms my pin-detection code is actually
+                // running for the probe (the previous gated-on-retries>0 log
+                // hid the "limit=0 + pinned" case, which is the dominant
+                // failure mode being diagnosed right now).
+                tracing::info!(
+                    model = %model_name,
+                    requested_retries = retries_left,
+                    pinned_via = field,
+                    "[migration] caller pinned a worker; effective retries=0 (preserves targeting for probe / EPP)"
+                );
+                0
+            }
+            None => retries_left,
+        };
         let mut slf = Self {
             context,
             request: preprocessed_request,
             next_generate: next,
             next_stream: None,
-            retries_left: retries_left + 1, // +1 to account for the initial attempt
+            retries_left: effective_retries + 1, // +1 to account for the initial attempt
+            retries_used: 0,
             model_name,
             metrics,
         };
@@ -138,15 +277,33 @@ impl RetryManager {
             };
             if let Some(response) = response_stream.next().await {
                 // Check if this is a migratable error that should trigger stream recreation.
-                if let Some(err) = response.err()
-                    && is_migratable(&err)
-                {
-                    tracing::warn!("Stream disconnected... recreating stream... {}", err);
-                    self.metrics.inc_migration_ongoing_request(&self.model_name);
-                    if let Err(err) = self.new_stream().await {
-                        tracing::warn!("Cannot recreate stream: {:#}", err);
+                if let Some(err) = response.err() {
+                    if is_migratable(&err) {
+                        tracing::warn!(
+                            request_id = %self.context.id(),
+                            error = %err,
+                            "Stream disconnected... recreating stream..."
+                        );
+                        self.metrics.inc_migration_ongoing_request(&self.model_name);
+                        if let Err(err) = self.new_stream().await {
+                            tracing::warn!(
+                                request_id = %self.context.id(),
+                                error = %format!("{err:#}"),
+                                "Cannot recreate stream"
+                            );
+                        } else {
+                            continue;
+                        }
                     } else {
-                        continue;
+                        // Non-migratable error mid-stream. Before this log, the path was silent:
+                        // we'd fall through to track_response + return without any indication
+                        // that migration decided NOT to retry. Surfacing this is essential for
+                        // diagnosing "why didn't migration recover" cases.
+                        tracing::warn!(
+                            request_id = %self.context.id(),
+                            error = %err,
+                            "[migration] mid-stream non-migratable error; propagating to client"
+                        );
                     }
                 }
                 self.track_response(&response);
@@ -157,9 +314,105 @@ impl RetryManager {
     }
 
     async fn new_stream(&mut self) -> Result<()> {
+        // If there's a stale stream, cancel the in-flight work on the prior
+        // worker before we drop the consumer side. Best-effort: a hung worker
+        // won't observe the cancel anyway, and a recovering worker will see
+        // it and stop generating into a queue that's already detached.
+        if let Some(prev) = self.next_stream.take() {
+            prev.context().stop_generating();
+        }
+
+        // The field-clearing (bootstrap_info, prefill_result, prefill_worker_id,
+        // decode_worker_id, backend_instance_id, decode_instance_id) used to live
+        // here, outside the retry loop — which meant it fired on the initial
+        // attempt too, destroying the caller's targeting before the routing
+        // layer ever saw it. Health probes (which pin via backend_instance_id /
+        // decode_instance_id) became silently broken: the cleared request was
+        // routed to a different live worker, the probe got 200, the dead worker
+        // looked healthy. Clearing belongs only on real retries — move it
+        // inside the loop and gate on `is_retry`.
+        let mut is_retry = false;
         let mut response_stream: Option<Result<ManyOut<Annotated<BackendOutput>>>> = None;
         while self.retries_left > 0 {
             self.retries_left -= 1;
+            if is_retry {
+                self.retries_used += 1;
+                // Clear disagg handoff state + pinned-worker routing hints so
+                // the retry gets a fresh prefill → fresh bootstrap_info →
+                // fresh decode pick, AND so the retry doesn't re-route via
+                // the preselected_id path to the (now-dead) worker we just
+                // failed on (kv_router/push_router.rs::select_worker — the
+                // phase-dispatched preselected_id lookup bypasses
+                // find_best_match's avail filter).
+                self.request.bootstrap_info = None;
+                self.request.prefill_result = None;
+                if let Some(routing) = self.request.routing.as_mut() {
+                    routing.prefill_worker_id = None;
+                    routing.decode_worker_id = None;
+                    routing.backend_instance_id = None;
+                    // Don't clear allowed_worker_ids — that's the upstream
+                    // client's intent (e.g. partitioning), not a per-attempt
+                    // routing stamp.
+                }
+                self.request.decode_instance_id = None;
+                tracing::info!(
+                    model = %self.model_name,
+                    retries_left = self.retries_left,
+                    request_id = %self.context.id(),
+                    "[migration] retry attempt: cleared pinned routing hints + disagg handoff state"
+                );
+
+                // Jittered backoff before re-admitting through the pipeline.
+                // When a worker dies with N in-flight requests, all N hit the
+                // retry path within the stall-timeout window (~10ms after
+                // report_instance_down fires). Without jitter, all N rejoin
+                // the admission filter simultaneously and burst-saturate the
+                // surviving workers — most get rejected as 429 even though
+                // there was capacity if requests had arrived spread out.
+                //
+                // `DYN_MIGRATION_RETRY_JITTER_MS` controls the jitter window.
+                // Each retry sleeps `uniform(0, jitter_ms)` before its next
+                // attempt at next_generate. Unset / 0 disables (current
+                // behavior — no jitter). Sleeps are cancellable via the
+                // request context: if the client disconnects mid-sleep we
+                // exit the migration loop with an error.
+                //
+                // The sleep does NOT block the frontend tokio runtime:
+                // tokio::time::sleep yields the executor. Other requests on
+                // other tasks proceed normally. The request holds no
+                // admission slot / GPU resource / routing decision during
+                // the sleep — it's invisible to the admission filter until
+                // next_generate.generate() actually runs.
+                let jitter_ms = std::env::var("DYN_MIGRATION_RETRY_JITTER_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if jitter_ms > 0 {
+                    use rand::Rng;
+                    let delay_ms = rand::thread_rng().gen_range(0..jitter_ms);
+                    tracing::debug!(
+                        request_id = %self.context.id(),
+                        retries_used = self.retries_used,
+                        delay_ms,
+                        jitter_window_ms = jitter_ms,
+                        "[migration] retry jitter sleep"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                        _ = self.context.stopped() => {
+                            tracing::info!(
+                                request_id = %self.context.id(),
+                                "[migration] context stopped during retry jitter; aborting"
+                            );
+                            return Err(Error::msg(format!(
+                                "Context id {} stopped during retry jitter",
+                                self.context.id()
+                            )));
+                        }
+                    }
+                }
+            }
+            is_retry = true;
             let request = Context::with_id(self.request.clone(), self.context.id().to_string());
             self.context.link_child(request.context());
             if self.context.is_stopped() || self.context.is_killed() {
@@ -170,17 +423,54 @@ impl RetryManager {
                 )));
             }
             response_stream = Some(self.next_generate.generate(request).await);
-            if let Some(err) = response_stream.as_ref().unwrap().as_ref().err()
-                && is_migratable(err.as_ref())
-            {
-                tracing::warn!("Creating new stream... retrying... {}", err);
-                self.metrics.inc_migration_new_request(&self.model_name);
-                continue;
+            if let Some(err) = response_stream.as_ref().unwrap().as_ref().err() {
+                if is_migratable(err.as_ref()) {
+                    tracing::warn!(
+                        request_id = %self.context.id(),
+                        retries_left = self.retries_left,
+                        error = %err,
+                        "Creating new stream... retrying..."
+                    );
+                    self.metrics.inc_migration_new_request(&self.model_name);
+                    continue;
+                } else {
+                    // The biggest silent-failure path we know about: an error
+                    // returned synchronously from the pipeline that doesn't
+                    // match the migratable allowlist. Examples observed in
+                    // prod: "no endpoints available to route work" (kv_router
+                    // scheduler when avail set is empty) and "No disaggregated
+                    // params in prefill response" (prefill_router parse error).
+                    // Both are TRANSIENT in nature (the cluster recovers) but
+                    // were classified as fatal here — request fails with 500
+                    // and no retry log fires. Surfacing this is the single
+                    // most useful migration-side diagnostic.
+                    tracing::warn!(
+                        request_id = %self.context.id(),
+                        retries_left = self.retries_left,
+                        retries_used = self.retries_used,
+                        error = %err,
+                        error_chain = ?err,
+                        "[migration] non-migratable error from pipeline; will NOT retry"
+                    );
+                }
             }
             break;
         }
         match response_stream {
             Some(Ok(next_stream)) => {
+                if self.retries_used > 0 {
+                    // Single-line per-request recovery summary. Greppable as
+                    // [migration_summary]; gives the count of cumulative
+                    // retries across this request's lifecycle without
+                    // having to correlate the per-attempt warn logs.
+                    tracing::info!(
+                        model = %self.model_name,
+                        request_id = %self.context.id(),
+                        retries_used = self.retries_used,
+                        retries_left = self.retries_left,
+                        "[migration_summary] recovered via retry"
+                    );
+                }
                 self.next_stream = Some(next_stream);
                 Ok(())
             }

@@ -98,6 +98,55 @@ impl WorkHandlerMetrics {
     }
 }
 
+/// Worker-side equivalent of the frontend `osl > 0` gate in
+/// `per_request_log.rs`: returns true when a chunk carries real
+/// generation output (tokens / embeddings / multimodal content parts) that
+/// should count toward the `last_successful_request` stamp.
+///
+/// Uses a byte-scan of the already-serialized JSON rather than a trait
+/// bound on `U` so the gate works uniformly across every Ingress
+/// instantiation — including ones whose response types live in foreign
+/// crates (e.g. `dynamo_async_openai::types::CreateChatCompletionStreamResponse`)
+/// that can't carry a local-crate trait impl due to the orphan rule.
+/// `serde_json::to_vec` always emits compact JSON so these substrings are
+/// stable.
+///
+/// Semantics:
+/// - LLM/Backend output chunks (carry a `token_ids` field) — positive iff
+///   token_ids is non-empty OR `content_parts` carries multimodal content.
+///   Catches the trtllm `handler_base.py` error-chunk shape
+///   (`{"finish_reason": {"error": "..."}, "token_ids": []}`, see
+///   2026-05-19 incident) AND the stop-only-terminator shape (engine
+///   yields nothing useful, just a Stop finish_reason).
+/// - Embedding chunks (carry an `embeddings` field) — positive iff
+///   embeddings is non-empty.
+/// - Anything else (kv-router RPCs, framing-only Annotated wrappers,
+///   opaque test payloads) — positive by default; preserves pre-fix
+///   any-chunk-counts semantics for non-engine handlers.
+fn chunk_has_output_contribution(resp_bytes: &[u8]) -> bool {
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+    let has_token_ids_field = contains(resp_bytes, b"\"token_ids\":");
+    let has_embeddings_field = contains(resp_bytes, b"\"embeddings\":");
+    if !has_token_ids_field && !has_embeddings_field {
+        // Non-engine chunk — preserve pre-fix any-chunk-counts semantics.
+        return true;
+    }
+    if has_token_ids_field {
+        // token_ids present-and-non-empty wins outright.
+        if !contains(resp_bytes, b"\"token_ids\":[]") {
+            return true;
+        }
+        // token_ids empty: accept multimodal `content_parts` as an escape.
+        // Compact serialization of `Vec<ContentPart>` with at least one
+        // element begins `[{`; the empty-vec form `[]` does not match.
+        return contains(resp_bytes, b"\"content_parts\":[{");
+    }
+    // embeddings-only path: positive iff non-empty.
+    !contains(resp_bytes, b"\"embeddings\":[]")
+}
+
 // RAII guard to ensure inflight gauge is decremented and request duration is observed on all code paths.
 struct RequestMetricsGuard {
     inflight_requests: prometheus::IntGauge,
@@ -272,6 +321,25 @@ where
 
         let context = stream.context();
 
+        // Stamp `last_successful_request` (read by /health/{prefill,decode}
+        // Bypass B) on every chunk that carries real generation output —
+        // tokens / embeddings / multimodal content parts, not framing or
+        // error markers. Per-chunk stamping matters for long generations
+        // (Kimi thinking + multi-thousand-token output can run minutes):
+        // end-of-stream stamping would leave Bypass B stale for the entire
+        // stream duration even though the worker is actively producing
+        // output throughout.
+        //
+        // Gate excludes:
+        //   - degraded engines yielding zero chunks (2026-05-14 outage —
+        //     prefill `disaggregated_params=None` failures)
+        //   - degraded engines yielding only error-finish-reason chunks
+        //     (2026-05-19 incident — trtllm handler_base.py yields these
+        //     instead of raising)
+        //   - stop-only terminators with empty token_ids
+        // Mirrors the frontend-side `osl > 0` gate in per_request_log.rs
+        // but at the worker side, since the frontend gate doesn't run
+        // for the active-traffic bypass paths.
         // TODO: Detect end-of-stream using Server-Sent Events (SSE)
         let mut send_complete_final = true;
         while let Some(resp) = stream.next().await {
@@ -282,6 +350,7 @@ where
             };
             let resp_bytes = serde_json::to_vec(&resp_wrapper)
                 .expect("fatal error: invalid response object - this should never happen");
+            let resp_has_output = chunk_has_output_contribution(&resp_bytes);
             if let Some(m) = self.metrics() {
                 m.response_bytes.inc_by(resp_bytes.len() as u64);
             }
@@ -311,6 +380,14 @@ where
                 }
                 break;
             }
+            // Stamp on each output-bearing chunk after publisher.send
+            // succeeds. Read by /health Bypass B; per-chunk freshness here
+            // keeps long-running streams from appearing stale mid-generation.
+            if resp_has_output
+                && let Some(handle) = self.last_successful_request.get()
+            {
+                *handle.write().unwrap() = Some(std::time::Instant::now());
+            }
         }
         if send_complete_final {
             let resp_wrapper = NetworkStreamWrapper::<U> {
@@ -338,10 +415,8 @@ where
             if let Some(notifier) = self.endpoint_health_check_notifier.get() {
                 notifier.notify_one();
             }
-            // Record successful request for e2e health check caching
-            if let Some(handle) = self.last_successful_request.get() {
-                *handle.write().unwrap() = Some(std::time::Instant::now());
-            }
+            // `last_successful_request` was stamped per-chunk during
+            // streaming above; no additional end-of-stream stamp needed.
         }
 
         // Ensure the metrics guard is not dropped until the end of the function.

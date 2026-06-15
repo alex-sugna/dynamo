@@ -51,6 +51,17 @@ fn build_protos() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .type_attribute(".", "#[derive(serde::Serialize,serde::Deserialize)]")
         .compile_protos(&["src/grpc/protos/kserve.proto"], &["src/grpc/protos"])?;
+
+    // SMG TrtllmService — vendored from smg/crates/grpc_client/proto/. Lets external
+    // routers (sgl-router / smg) drive this Dynamo instance with pre-tokenized input
+    // over the same gRPC contract they use for TRT-LLM, vLLM, SGLang.
+    tonic_build::configure()
+        .type_attribute(".", "#[derive(serde::Serialize,serde::Deserialize)]")
+        .compile_protos(
+            &["src/grpc/protos/trtllm_service.proto"],
+            &["src/grpc/protos"],
+        )?;
+
     Ok(())
 }
 

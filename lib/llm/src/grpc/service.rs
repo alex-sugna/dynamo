@@ -4,3 +4,4 @@
 pub mod kserve;
 pub mod openai;
 pub mod tensor;
+pub mod trtllm;

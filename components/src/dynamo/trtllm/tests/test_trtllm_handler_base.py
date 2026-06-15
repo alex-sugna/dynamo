@@ -17,6 +17,7 @@ if not torch.cuda.is_available():
         "CUDA/GPU not available, but tensorrt_llm import and the test require GPU.",
         allow_module_level=True,
     )
+from dynamo.trtllm.constants import DisaggregationMode
 from dynamo.trtllm.request_handlers.handler_base import HandlerBase
 
 pytestmark = [
@@ -305,6 +306,29 @@ class _ConcreteHandler(HandlerBase):
 
     async def generate(self, *args, **kwargs):
         raise NotImplementedError
+
+
+class TestPrepareInputForGeneration:
+    def _make_handler(self, disaggregation_mode: DisaggregationMode) -> HandlerBase:
+        config = MagicMock()
+        config.disaggregation_mode = disaggregation_mode
+        config.multimodal_processor = None
+        config.disable_request_abort = False
+        config.shutdown_event = None
+        return _ConcreteHandler(config)
+
+    @pytest.mark.asyncio
+    async def test_decode_uses_prefill_token_ids_without_prompt(self):
+        handler = self._make_handler(DisaggregationMode.DECODE)
+
+        processed = await handler._prepare_input_for_generation(
+            request={"token_ids": [1, 163605, 2]},
+            embeddings=None,
+            ep_disaggregated_params=None,
+            epd_metadata={"_prefill_prompt_token_ids": [11, 22, 33]},
+        )
+
+        assert processed == {"prompt_token_ids": [11, 22, 33]}
 
 
 class TestHandleCancellationAbortToggle:

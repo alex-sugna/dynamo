@@ -38,6 +38,15 @@ pub struct Client {
     instance_avail_tx: Arc<tokio::sync::watch::Sender<Vec<u64>>>,
     // Watch receiver for available instance IDs (for cloning to external subscribers)
     instance_avail_rx: tokio::sync::watch::Receiver<Vec<u64>>,
+    /// Strong reference to the per-endpoint shared avail state. Keeps the
+    /// Weak<SharedAvailState> in `DistributedRuntime::endpoint_avail_states`
+    /// alive for the lifetime of this Client (and all its clones). Without
+    /// this field, the Arc<SharedAvailState> created in
+    /// `get_or_create_shared_avail_state` drops at the end of
+    /// `with_reconcile_interval` — the Weak dies, the next Client::new
+    /// builds a fresh one, and the cache becomes useless. (Found in xp via
+    /// `shared_avail_ptr` being different across boot logs.)
+    _shared_avail_state: Arc<crate::distributed::SharedAvailState>,
     /// Interval for periodic reconciliation of instance_avail with instance_source.
     /// This ensures instances removed via `report_instance_down` are eventually restored.
     reconcile_interval: Duration,
@@ -62,27 +71,84 @@ impl Client {
         );
         let instance_source = Self::get_or_create_dynamic_instance_source(&endpoint).await?;
 
-        // Seed instance_avail from the current instance_source snapshot so that
-        // callers who proceed immediately after wait_for_instances (which reads
-        // instance_source directly) will also find instances in instance_avail
-        // (which is read by the routing methods like random/round_robin).
+        // Per-endpoint shared avail state. Fixed an architectural bug where each
+        // `Client::new` for the same endpoint created its own `instance_avail`
+        // ArcSwap + watch channel — `report_instance_down` on one Client wouldn't
+        // propagate to any other Client for the same endpoint. The prefill_router's
+        // live-partition filter was the visible victim: it read
+        // `runtime_config_watch`'s joined view (which subscribes to a DIFFERENT
+        // Client's `instance_avail_watcher`) and never saw the decode push router's
+        // inhibitions. Sharing the state per-endpoint at the DRT level makes all
+        // Clients for the same endpoint observe the same in-process avail view.
+        let (shared, freshly_created) =
+            Self::get_or_create_shared_avail_state(&endpoint, &instance_source).await?;
+        if freshly_created {
+            tracing::info!(
+                endpoint = %endpoint.id(),
+                shared_avail_ptr = format!("{:p}", std::sync::Arc::as_ptr(&shared.instance_avail)),
+                shared_tx_ptr = format!("{:p}", std::sync::Arc::as_ptr(&shared.instance_avail_tx)),
+                initial_avail_count = shared.instance_avail.load().len(),
+                "[client] created shared avail state for endpoint"
+            );
+        } else {
+            tracing::debug!(
+                endpoint = %endpoint.id(),
+                shared_avail_ptr = format!("{:p}", std::sync::Arc::as_ptr(&shared.instance_avail)),
+                "[client] reused shared avail state for endpoint"
+            );
+        }
+        let client = Client {
+            endpoint: endpoint.clone(),
+            instance_source: instance_source.clone(),
+            instance_avail: shared.instance_avail.clone(),
+            instance_free: shared.instance_free.clone(),
+            instance_avail_tx: shared.instance_avail_tx.clone(),
+            instance_avail_rx: shared.instance_avail_rx.clone(),
+            _shared_avail_state: shared.clone(),
+            reconcile_interval,
+        };
+        // monitor_instance_source still runs per-Client. Since every Client now
+        // shares the same `instance_avail` ArcSwap, redundant tasks idempotently
+        // write the same instance_source snapshot — wasteful but not incorrect.
+        // The cache holds Weak refs, so once the last Client drops, the shared
+        // state and its monitor tasks both naturally clean up.
+        client.monitor_instance_source();
+        Ok(client)
+    }
+
+    /// Look up or create the per-endpoint shared `instance_avail` state on the DRT.
+    /// Returns the shared `Arc<SharedAvailState>` and a boolean indicating whether
+    /// this call freshly created the state (for one-shot logging).
+    async fn get_or_create_shared_avail_state(
+        endpoint: &Endpoint,
+        instance_source: &Arc<tokio::sync::watch::Receiver<Vec<Instance>>>,
+    ) -> Result<(Arc<crate::distributed::SharedAvailState>, bool)> {
+        let drt = endpoint.drt();
+        let states = drt.endpoint_avail_states();
+        let mut states = states.lock().await;
+
+        if let Some(weak) = states.get(endpoint) {
+            if let Some(strong) = weak.upgrade() {
+                return Ok((strong, false));
+            } else {
+                states.remove(endpoint);
+            }
+        }
+
         let initial_ids: Vec<u64> = instance_source
             .borrow()
             .iter()
             .map(|instance| instance.id())
             .collect();
         let (avail_tx, avail_rx) = tokio::sync::watch::channel(initial_ids.clone());
-        let client = Client {
-            endpoint: endpoint.clone(),
-            instance_source: instance_source.clone(),
+        let state = Arc::new(crate::distributed::SharedAvailState {
             instance_avail: Arc::new(ArcSwap::from(Arc::new(initial_ids.clone()))),
             instance_free: Arc::new(ArcSwap::from(Arc::new(initial_ids))),
             instance_avail_tx: Arc::new(avail_tx),
             instance_avail_rx: avail_rx,
-            reconcile_interval,
-        };
-        client.monitor_instance_source();
-        Ok(client)
+        });
+        states.insert(endpoint.clone(), Arc::downgrade(&state));
+        Ok((state, true))
     }
 
     /// Instances available from watching key-value store
@@ -134,17 +200,45 @@ impl Client {
 
     /// Mark an instance as down/unavailable
     pub fn report_instance_down(&self, instance_id: u64) {
-        let filtered = self
-            .instance_ids_avail()
+        let before: Vec<u64> = self.instance_ids_avail().iter().copied().collect();
+        let filtered: Vec<u64> = before
             .iter()
-            .filter_map(|&id| if id == instance_id { None } else { Some(id) })
-            .collect::<Vec<_>>();
+            .copied()
+            .filter(|&id| id != instance_id)
+            .collect();
+        let was_present = filtered.len() != before.len();
         self.instance_avail.store(Arc::new(filtered.clone()));
 
         // Notify watch channel subscribers about the change
-        let _ = self.instance_avail_tx.send(filtered);
+        let _ = self.instance_avail_tx.send(filtered.clone());
 
-        tracing::debug!("inhibiting instance {instance_id}");
+        // INFO every inhibit (was debug). Useful to correlate stall-fire +
+        // ensuing migration retries. Includes the shared-state pointer so an
+        // operator can verify all Clients for the endpoint resolved to the
+        // SAME shared avail (matching the pointer in the
+        // "created shared avail state" boot log).
+        tracing::info!(
+            endpoint = %self.endpoint.id(),
+            inhibited_instance = instance_id,
+            avail_count_before = before.len(),
+            avail_count_after = filtered.len(),
+            was_present,
+            shared_avail_ptr = format!("{:p}", Arc::as_ptr(&self.instance_avail)),
+            "[client] report_instance_down"
+        );
+
+        // Edge log when this report drops the avail set to 0 — the visible
+        // symptom of that state is "no endpoints available to route work"
+        // hitting client requests, which is non-migratable. Surfacing the
+        // edge makes the cascade window explicit instead of inferred.
+        if was_present && filtered.is_empty() {
+            tracing::warn!(
+                endpoint = %self.endpoint.id(),
+                inhibited_instance = instance_id,
+                shared_avail_ptr = format!("{:p}", Arc::as_ptr(&self.instance_avail)),
+                "[client] instance_avail dropped to 0 — new requests will fail with 'no endpoints available' until reconcile restores workers"
+            );
+        }
     }
 
     /// Update the set of free instances based on busy instance IDs
@@ -176,6 +270,19 @@ impl Client {
                     .iter()
                     .map(|instance| instance.id())
                     .collect();
+
+                // Edge-log when reconcile restores avail from 0 → N. Pairs
+                // with the report_instance_down edge log: together they bound
+                // the window during which clients see "no endpoints available".
+                let prev_avail_count = client.instance_ids_avail().len();
+                if prev_avail_count == 0 && !instance_ids.is_empty() {
+                    tracing::warn!(
+                        endpoint = %endpoint_id,
+                        restored_count = instance_ids.len(),
+                        "[client] instance_avail restored from 0 to {} via reconcile",
+                        instance_ids.len()
+                    );
+                }
 
                 // TODO: this resets both tracked available and free instances
                 client.instance_avail.store(Arc::new(instance_ids.clone()));

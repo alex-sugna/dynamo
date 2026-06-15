@@ -15,6 +15,7 @@
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import re
@@ -150,8 +151,17 @@ class HandlerBase(BaseGenerativeHandler):
             if token_logprobs_dict is None:
                 continue
 
-            # Get the actual token_id that was generated at this position
-            actual_token_id = output.token_ids[num_output_tokens_so_far + token_idx]
+            # Under MTP / draft-speculation, TRTLLM may emit more logprobs
+            # entries than committed token_ids (one per drafted position,
+            # not just accepted). Bound the index to len(token_ids) so a
+            # mismatch doesn't crash the worker with IndexError. Observed
+            # in xp-kimi-smg-austin-d630cf on a logprobs=true,
+            # max_tokens=256 request through the SMG-fronted Kimi 1P1D
+            # stack — decode pod died mid-stream.
+            tok_pos = num_output_tokens_so_far + token_idx
+            if tok_pos >= len(output.token_ids):
+                break
+            actual_token_id = output.token_ids[tok_pos]
 
             # Extract log probability for the selected token
             if actual_token_id in token_logprobs_dict:
@@ -167,17 +177,17 @@ class HandlerBase(BaseGenerativeHandler):
             # NOTE: TRTLLM LogProb API doesn't have decoded_token, will default to None
             token_top_logprobs = []
             for tok_id, logprob_info in token_logprobs_dict.items():
+                # rank defaults to None in TRT-LLM's Logprob dataclass; under
+                # MTP it often stays None. Dynamo's Rust TopLogprob.rank is
+                # u32 (not Option<u32>), so emitting null here causes
+                # `invalid type: null, expected u32` deserialization failure.
+                rank = getattr(logprob_info, "rank", None)
+                token = getattr(logprob_info, "decoded_token", None)
                 token_top_logprobs.append(
                     {
-                        "rank": logprob_info.rank
-                        if hasattr(logprob_info, "rank")
-                        else 0,
+                        "rank": rank if rank is not None else 0,
                         "token_id": tok_id,
-                        "token": (
-                            logprob_info.decoded_token
-                            if hasattr(logprob_info, "decoded_token")
-                            else None
-                        ),
+                        "token": token if token is not None else "",
                         "logprob": float(logprob_info.logprob),
                     }
                 )
@@ -520,6 +530,8 @@ class HandlerBase(BaseGenerativeHandler):
         has_prefill_metadata = epd_metadata and (
             epd_metadata.get("_prefill_prompt")
             or epd_metadata.get("_epd_processed_prompt")
+            or epd_metadata.get("_prefill_prompt_token_ids")
+            or epd_metadata.get("_epd_prompt_token_ids")
         )
 
         if (
@@ -540,14 +552,11 @@ class HandlerBase(BaseGenerativeHandler):
             # - Simple P→D (image URL): PREFILL used multi_modal_data
             is_epd_flow = epd_metadata.get("_epd_processed_prompt") is not None
 
-            processed_input = {
-                "prompt": prefill_prompt,
-                "prompt_token_ids": prefill_token_ids,
-            }
+            processed_input = {"prompt_token_ids": prefill_token_ids}
+            if prefill_prompt is not None:
+                processed_input["prompt"] = prefill_prompt
             if is_epd_flow:
                 processed_input["multi_modal_embeddings"] = None
-            else:
-                processed_input["multi_modal_data"] = None
             return processed_input
 
         # PREFILL/ENCODE/AGGREGATED: Process multimodal content if available
@@ -601,7 +610,35 @@ class HandlerBase(BaseGenerativeHandler):
             request["sampling_options"]["temperature"] = request.pop("temperature")
 
     async def _initiate_shutdown(self, error: Exception):
-        """Initiate graceful shutdown after fatal error"""
+        """Initiate graceful shutdown after fatal error.
+
+        Set ``DYN_TRTLLM_DISABLE_FATAL_SHUTDOWN=1`` to opt out: the
+        worker logs the error and *keeps running* instead of tearing
+        down. The single failed request still propagates its error to
+        the client; subsequent requests continue to be served. This
+        matters in production because a single transient TRT-LLM
+        protocol error (e.g. invalid disaggregated_params, missing
+        ctx_request_id) would otherwise kill the whole worker —
+        cascading session loss and forcing all in-flight cached
+        sessions to migrate to other workers, which then face full
+        prefill load. The k8s liveness probe (``/health/<role>``)
+        remains the authoritative kill signal: it only fires after
+        the worker is observably unable to serve, with the configured
+        failureThreshold protecting against single-request blips.
+        """
+        if os.environ.get("DYN_TRTLLM_DISABLE_FATAL_SHUTDOWN", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            logging.error(
+                "Suppressed fatal shutdown (DYN_TRTLLM_DISABLE_FATAL_SHUTDOWN set); "
+                "worker will keep running. Underlying error: %s",
+                error,
+            )
+            return
+
         logging.warning(f"Initiating graceful shutdown due to: {error}")
 
         try:
@@ -785,6 +822,27 @@ class HandlerBase(BaseGenerativeHandler):
         )
 
         try:
+            # XP test hooks (env-gated, no-op when unset). Both target the
+            # worker-side health-check bypass surface in
+            # system_status_server.rs without touching the engine.
+            #
+            # XP_FORCE_REQUEST_ERROR → raises RequestError immediately,
+            # yields the trtllm error-chunk shape down the stream.
+            # XP_FORCE_HANG → blocks until the request is cancelled, so
+            # the worker is alive-but-wedged from the probe's POV.
+            _xp_force_err = os.environ.get("XP_FORCE_REQUEST_ERROR")
+            if _xp_force_err:
+                raise RequestError(_xp_force_err)
+            if os.environ.get("XP_FORCE_HANG"):
+                # asyncio.CancelledError exits cleanly via the
+                # except branch below; never returns normally.
+                await asyncio.sleep(86400)
+            # Forward per-message hashes (set by SMG via --enable-message-hash
+            # and threaded through Dynamo's gRPC frontend → CommonExt →
+            # CompletionRequest.message_hashes) into the engine so they land
+            # in TRT's RequestStatistics.message_hashes log field.
+            message_hashes = request.get("message_hashes")
+
             # Pass timestamps to generate_async - only prefill needs the full set
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 generation_result = self.engine.llm.generate_async(
@@ -796,6 +854,7 @@ class HandlerBase(BaseGenerativeHandler):
                     scheduling_params=scheduling_params,
                     request_id=request_id,
                     trtllm_returns_disagg_params_at=trtllm_returns_disagg_params_at,
+                    message_hashes=message_hashes,
                 )
             else:
                 generation_result = self.engine.llm.generate_async(
@@ -811,6 +870,7 @@ class HandlerBase(BaseGenerativeHandler):
                     preprocessing_end_at=preprocessing_end_at,
                     request_handler_received_at=request_handler_received_at,
                     engine_submit_at=engine_submit_at,
+                    message_hashes=message_hashes,
                 )
 
             # Monitor for cancellation triggers and cancel by calling generation_result.abort()
@@ -855,63 +915,90 @@ class HandlerBase(BaseGenerativeHandler):
                         # Return the disaggregated params only when operating in prefill mode.
                         prefill_disagg = output.disaggregated_params
                         trtllm_returns_disagg_params_at = time.time()
-
-                        # Validate disaggregated_params before returning
-                        if not prefill_disagg:
-                            raise ValueError(
-                                f"TRT-LLM returned None disaggregated_params. request_id={request_id}"
-                            )
-
-                        missing_fields = []
-                        if prefill_disagg.ctx_request_id is None:
-                            missing_fields.append("ctx_request_id")
-                        if prefill_disagg.first_gen_tokens is None:
-                            missing_fields.append("first_gen_tokens")
-                        if prefill_disagg.opaque_state is None:
-                            missing_fields.append("opaque_state")
-
-                        if missing_fields:
-                            logging.error(
-                                f"[prefill disagg] request_id={request_id} "
-                                f"ctx_request_id={prefill_disagg.ctx_request_id} "
-                                f"first_gen_tokens={prefill_disagg.first_gen_tokens} "
-                                f"opaque_state_len={len(prefill_disagg.opaque_state) if prefill_disagg.opaque_state else 'None'}"
-                            )
-                            raise ValueError(
-                                f"TRT-LLM returned invalid disaggregated_params: missing {', '.join(missing_fields)}. "
-                                f"request_id={request_id}"
-                            )
-
-                        params_dict = self._encode_and_pack_disaggregated_params(
-                            output, disaggregated_params, request, res, processed_input
+                        # [PD_TIMING] Stamped at the start of the per-request PREFILL
+                        # handler body, right when the engine output is in hand. The
+                        # delta to `kv_send_start` (from the prefill statistics line)
+                        # measures the C++→Ray→asyncio handoff cost on this pod under
+                        # current load; the delta to the prefill_yield event below
+                        # measures the cost of _encode_and_pack_disaggregated_params.
+                        logging.info(
+                            f"[PD_TIMING] event=prefill_handler_woken "
+                            f"request_id={request_id} "
+                            f"trtllm_returns_disagg_params_at={trtllm_returns_disagg_params_at:.6f}"
                         )
-                        if params_dict is not None:
-                            out["disaggregated_params"] = params_dict
-                            # Pass timestamps through to decode worker
-                            out["disaggregated_params"]["request_handler_received_at"] = request_handler_received_at
-                            out["disaggregated_params"]["engine_submit_at"] = engine_submit_at
-                            out["disaggregated_params"]["trtllm_returns_disagg_params_at"] = trtllm_returns_disagg_params_at
+
+                        # Prefill may terminate the request itself (EOS / stop
+                        # word emitted on the first generated token). In that
+                        # case TRT-LLM does not queue a KV transfer and emits
+                        # no disaggregated_params — the response is already
+                        # complete and decode is not needed. Skip the
+                        # disagg_params validation and let the prefill-only
+                        # response flow back to the client.
+                        terminal_in_prefill = (
+                            output.finish_reason in ("stop", "eos", "end_id")
+                            and not prefill_disagg
+                        )
+
+                        if not terminal_in_prefill:
+                            # Validate disaggregated_params before returning
+                            if not prefill_disagg:
+                                raise ValueError(
+                                    f"TRT-LLM returned None disaggregated_params. request_id={request_id}"
+                                )
+
+                            missing_fields = []
+                            if prefill_disagg.ctx_request_id is None:
+                                missing_fields.append("ctx_request_id")
+                            if prefill_disagg.first_gen_tokens is None:
+                                missing_fields.append("first_gen_tokens")
+                            if prefill_disagg.opaque_state is None:
+                                missing_fields.append("opaque_state")
+
+                            if missing_fields:
+                                logging.error(
+                                    f"[prefill disagg] request_id={request_id} "
+                                    f"ctx_request_id={prefill_disagg.ctx_request_id} "
+                                    f"first_gen_tokens={prefill_disagg.first_gen_tokens} "
+                                    f"opaque_state_len={len(prefill_disagg.opaque_state) if prefill_disagg.opaque_state else 'None'}"
+                                )
+                                raise ValueError(
+                                    f"TRT-LLM returned invalid disaggregated_params: missing {', '.join(missing_fields)}. "
+                                    f"request_id={request_id}"
+                                )
+
+                            params_dict = self._encode_and_pack_disaggregated_params(
+                                output, disaggregated_params, request, res, processed_input
+                            )
+                            if params_dict is not None:
+                                out["disaggregated_params"] = params_dict
+                                # Pass timestamps through to decode worker
+                                out["disaggregated_params"]["request_handler_received_at"] = request_handler_received_at
+                                out["disaggregated_params"]["engine_submit_at"] = engine_submit_at
+                                out["disaggregated_params"]["trtllm_returns_disagg_params_at"] = trtllm_returns_disagg_params_at
 
                     if out.get("finish_reason"):
                         num_input_tokens = len(request.get("token_ids", []))
 
-                        prompt_tokens_details = None
+                        # Always emit prompt_tokens_details (with cached_tokens=0
+                        # if no hits) so OpenAI clients can rely on the field
+                        # being present. Previously this was None when no cache
+                        # hits — which broke clients that expect the standard
+                        # OpenAI shape `usage.prompt_tokens_details.cached_tokens`.
+                        prompt_tokens_details = {"cached_tokens": 0}
                         if prefill_prompt_tokens_details:
                             prompt_tokens_details = prefill_prompt_tokens_details
-                        else:
-                            if output.request_perf_metrics is not None:
-                                kv_cache_metrics = (
-                                    output.request_perf_metrics.kv_cache_metrics
-                                )
-                                cached_tokens = min(
-                                    num_input_tokens,
-                                    kv_cache_metrics.num_reused_blocks
-                                    * self.kv_block_size,
-                                )
-                                if cached_tokens > 0:
-                                    prompt_tokens_details = {
-                                        "cached_tokens": int(cached_tokens),
-                                    }
+                        elif output.request_perf_metrics is not None:
+                            kv_cache_metrics = (
+                                output.request_perf_metrics.kv_cache_metrics
+                            )
+                            cached_tokens = min(
+                                num_input_tokens,
+                                kv_cache_metrics.num_reused_blocks
+                                * self.kv_block_size,
+                            )
+                            prompt_tokens_details = {
+                                "cached_tokens": int(cached_tokens),
+                            }
 
                         # [together] Exclude prefill early-return tokens from decode's count
                         completion_tokens = int(next_total_toks - num_output_tokens_so_far_initial)
@@ -950,6 +1037,24 @@ class HandlerBase(BaseGenerativeHandler):
                         except Exception as e:
                             logging.warning(f"Failed to log TensorRT-LLM metrics: {e}")
 
+                    # [PD_TIMING] In PREFILL mode there is exactly one yield per
+                    # request (max_tokens=1). Log it so we can measure the
+                    # _encode_and_pack_disaggregated_params + post-process cost
+                    # (prefill_handler_yield - prefill_handler_woken) and compare
+                    # against when the Rust frontend actually receives the
+                    # first_output downstream.
+                    if (
+                        self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and trtllm_returns_disagg_params_at is not None
+                    ):
+                        _pd_yield_at = time.time()
+                        logging.info(
+                            f"[PD_TIMING] event=prefill_handler_yield "
+                            f"request_id={request_id} "
+                            f"yield_at={_pd_yield_at:.6f} "
+                            f"python_processing_ms={(_pd_yield_at - trtllm_returns_disagg_params_at) * 1000:.3f}"
+                        )
+
                     # Yield the chunk to the client and update the token count for the next iteration.
                     yield out
                     num_output_tokens_so_far = next_total_toks
@@ -962,7 +1067,16 @@ class HandlerBase(BaseGenerativeHandler):
 
         # 2. Per-request errors - send to client, don't shutdown
         except RequestError as e:
-            error_msg = str(e)
+            # RequestError carries an HTTP `code` class attribute (see
+            # tensorrt_llm.executor.utils): 400 for InvalidRequestError
+            # (validation), 500 for plain RequestError (engine-side fault —
+            # KV transfer timeout, BaseWorker enqueue wrap, etc). Always
+            # encode as {"code": ..., "message": ...} so downstream Rust paths
+            # (HTTP openai.rs::extract_backend_error_if_present and gRPC
+            # trtllm.rs::engine_error_str_to_status) map to the right status
+            # without string-classifying the message.
+            code = getattr(e, "code", 500)
+            error_msg = json.dumps({"code": code, "message": str(e)})
             logging.warning(f"Request {request_id} error: {error_msg}")
             yield {
                 "finish_reason": {"error": error_msg},

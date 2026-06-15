@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -16,6 +17,7 @@ use serde_json::json;
 use tracing::Instrument;
 
 use crate::{
+    admission::prefill_throughput,
     kv_router::{
         KvRouter,
         metrics::RouterRequestMetrics,
@@ -61,6 +63,13 @@ struct RequestGuard {
     isl_tokens: usize,
     block_size: usize,
     expected_output_tokens: Option<u32>,
+    /// Worker (with dp_rank) this request was dispatched to. Used to
+    /// credit the per-worker prefill-throughput tracker when prefill
+    /// completes (see `on_item`). Together with `uncached_tokens` it
+    /// gives the TogetherSelector enough signal to estimate
+    /// `ms_per_uncached_token` for predicted-TTFT admission.
+    routed_worker: WorkerWithDpRank,
+    uncached_tokens: u32,
 }
 
 impl RequestGuard {
@@ -78,6 +87,11 @@ impl RequestGuard {
                         self.context_id
                     );
                 }
+                // First-token arrival on this request = a prefill of
+                // `uncached_tokens` tokens just finished on `routed_worker`.
+                // Credit the per-worker throughput tracker so the
+                // admission filter can estimate ms-per-uncached-token.
+                prefill_throughput().record(self.routed_worker, self.uncached_tokens);
                 self.prefill_marked = true;
             }
         }
@@ -201,7 +215,29 @@ impl KvPushRouter {
         let dp_rank = routing.and_then(|r| r.dp_rank).unwrap_or(0);
         let expected_output_tokens = routing.and_then(|r| r.expected_output_tokens);
         let allowed_worker_ids = routing.and_then(|r| r.allowed_worker_ids.clone());
+        let partition_group = routing.and_then(|r| r.partition_group.clone());
         let (routing_token_ids, block_mm_infos) = request.block_mm_routing_info();
+
+        // Intersect with the underlying Client's inhibit-filtered set so KV
+        // routing respects instances marked down via report_instance_down.
+        // Without this, KV routing happily re-picks a worker that the fault
+        // detector has flagged as dead, defeating migration retries in the
+        // typical PD deployment (random/round_robin already use
+        // `instance_ids_avail()` directly in PushRouter, but KV mode bypasses
+        // that and feeds the chooser only the request's allowed_worker_ids).
+        let avail_set: HashSet<u64> = self
+            .inner
+            .client
+            .instance_ids_avail()
+            .iter()
+            .copied()
+            .collect();
+        let allowed_worker_ids = match allowed_worker_ids {
+            Some(client_allowed) => {
+                Some(client_allowed.intersection(&avail_set).copied().collect())
+            }
+            None => Some(avail_set),
+        };
 
         // Get pre-selected worker based on phase, with explicit decode targeting
         // and backend_instance_id as fallback.
@@ -214,6 +250,30 @@ impl KvPushRouter {
                 .or_else(|| routing.and_then(|r| r.decode_worker_id.or(r.backend_instance_id))),
             RequestPhase::Aggregated => routing.and_then(|r| r.backend_instance_id),
         };
+        // [pin_trace:9/select_worker] After branch selection. Critical
+        // distinguishing log:
+        //  - phase=Decode + preselected_id=Some(<pin>): pin honored at
+        //    routing layer; bug must be downstream (transport/NATS).
+        //  - phase=Decode + preselected_id=None: pin was None at this point,
+        //    cleared between [pin_trace:8] and here (very narrow window).
+        //  - phase=Aggregated: phase race; tracker.set_phase(Decode) didn't
+        //    take effect before select_worker ran. THIS is what we expect
+        //    on production based on hypothesis (a). The Aggregated branch
+        //    reads only `routing.backend_instance_id`, which PrefillRouter
+        //    cleared at line 1093-1095, hence None → find_best_match → LB.
+        tracing::info!(
+            target: "dynamo::pin_trace",
+            request_id = %context_id,
+            ?phase,
+            preselected_id = ?preselected_id,
+            decode_instance_id = ?request.decode_instance_id,
+            routing_prefill_worker_id = ?routing.and_then(|r| r.prefill_worker_id),
+            routing_decode_worker_id = ?routing.and_then(|r| r.decode_worker_id),
+            routing_backend_instance_id = ?routing.and_then(|r| r.backend_instance_id),
+            routing_partition_group = ?routing.and_then(|r| r.partition_group.clone()),
+            endpoint = %self.inner.client.endpoint.id(),
+            "[pin_trace:9/select_worker] computed preselected_id"
+        );
 
         let Some(id) = preselected_id else {
             let (best_worker, overlap_amount) = self
@@ -227,6 +287,7 @@ impl KvPushRouter {
                     lora_name,
                     priority_jump,
                     allowed_worker_ids,
+                    partition_group,
                 )
                 .await?;
 
@@ -340,6 +401,29 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             .map(|t| t.phase())
             .unwrap_or(RequestPhase::Aggregated);
 
+        // [pin_trace:8/kvpushrouter_entry] First log inside KvPushRouter.
+        // The MOST CRITICAL checkpoint. If pin is Some at [pin_trace:7] but
+        // None or wrong here, the loss is the boundary crossing through
+        // ServiceBackend::from_engine wrapper or the Operator linkage.
+        //
+        // ALSO: `phase` MUST be `Decode` here for the decode-side router.
+        // If it's `Aggregated`, the pin will be ignored (Aggregated branch
+        // of select_worker reads only routing.backend_instance_id which is
+        // cleared upstream). That's the "tracker phase not promoted" bug
+        // class.
+        tracing::info!(
+            target: "dynamo::pin_trace",
+            request_id = %context_id,
+            ?phase,
+            decode_instance_id = ?request.decode_instance_id,
+            routing_backend_instance_id = ?request.routing.as_ref().and_then(|r| r.backend_instance_id),
+            routing_decode_worker_id = ?request.routing.as_ref().and_then(|r| r.decode_worker_id),
+            has_tracker = request.tracker.is_some(),
+            endpoint = %self.inner.client.endpoint.id(),
+            instance_ids_avail_count = self.inner.client.instance_ids_avail().len(),
+            "[pin_trace:8/kvpushrouter_entry] KvPushRouter::generate entry"
+        );
+
         let block_size = self.chooser.block_size() as usize;
         let selection = self
             .select_worker(&context_id, &request, phase, is_query_only)
@@ -452,6 +536,16 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         let stream_context = response_stream.context();
         let context_for_monitoring = stream_context.clone();
 
+        // Capture for the throughput tracker. Approximated as the
+        // dp_rank-0 entry — TogetherSelector keys throughput by
+        // WorkerWithDpRank so attention_dp engines can have per-rank
+        // estimates, but the router selected at WorkerId granularity
+        // and exposes only the picked dp_rank here; we use it as
+        // observed. `uncached_tokens = isl − cached_tokens`.
+        let routed_worker = WorkerWithDpRank::new(instance_id, dp_rank);
+        let cached_tokens = (overlap_amount as usize).saturating_mul(block_size);
+        let uncached_tokens = isl_tokens.saturating_sub(cached_tokens) as u32;
+
         let wrapped_stream = Box::pin(async_stream::stream! {
             let mut guard = RequestGuard {
                 chooser: chooser.clone(),
@@ -468,6 +562,8 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 isl_tokens,
                 block_size,
                 expected_output_tokens,
+                routed_worker,
+                uncached_tokens,
             };
 
             loop {

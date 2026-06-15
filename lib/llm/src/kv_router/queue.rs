@@ -13,6 +13,7 @@ use super::protocols::WorkerWithDpRank;
 use super::scheduler::{SchedulingRequest, SchedulingResponse};
 use super::sequence::{ActiveSequencesMulti, SequenceRequest};
 use crate::discovery::RuntimeConfigWatch;
+use crate::observability::ROUTER_DECISION_TARGET;
 
 /// Large default for max_num_batched_tokens when not configured (effectively disables queueing for that worker)
 const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
@@ -142,6 +143,10 @@ impl SchedulerQueue {
         );
         request.decode_blocks = decode_blocks;
         request.prefill_tokens = prefill_tokens;
+        // Snapshot per-worker in-flight count BEFORE this request is
+        // added; the v2 admission filter uses it to gate workers whose
+        // engine batch is at capacity (max_inflight_per_worker).
+        request.pre_active_request_count = self.slots.active_request_counts();
 
         let selection = {
             let workers = self.workers_with_configs.borrow();
@@ -157,6 +162,93 @@ impl SchedulerQueue {
                 return;
             }
         };
+
+        // ─── router_decision observability event ───────────────────
+        // Snapshot the chosen worker's live load (post-admission of
+        // this request) and emit one structured tracing line. Every
+        // pick lands here, so across many picks the per-worker state
+        // is queryable via grep + aggregation. See
+        // `observability::router_decision` for field semantics.
+        {
+            let request_blocks =
+                request.isl_tokens.div_ceil(self.block_size as usize) as u64;
+            let request_cached_blocks = u64::from(selection.overlap_blocks);
+            let request_uncached_blocks =
+                request_blocks.saturating_sub(request_cached_blocks);
+
+            let snapshot = self.slots.worker_load_snapshot(selection.worker);
+            let (active_cached, active_uncached, active_count) = match snapshot {
+                Some(s) => (
+                    s.active_cached_blocks as u64,
+                    s.active_uncached_blocks as u64,
+                    s.active_request_count as u64,
+                ),
+                None => (0u64, 0u64, 0u64),
+            };
+
+            let kv_blocks_total = {
+                let configs = self.workers_with_configs.borrow();
+                configs
+                    .get(&selection.worker.worker_id)
+                    .and_then(|cfg| cfg.total_kv_blocks)
+            };
+
+            // Max overlap across ALL candidate workers (the per-worker
+            // overlap map computed by the indexer's find_matches). This
+            // is what a perfectly-sticky / no-load-balancing router would
+            // have achieved on this request; cached - max_overlap is the
+            // load-balancing regret. n_workers_seen counts how many
+            // workers had ANY overlap (so 0/1 ≈ cold prefix, no regret
+            // possible by definition).
+            let max_overlap_blocks = request
+                .overlaps
+                .scores
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0) as u64;
+            let n_workers_seen =
+                request.overlaps.scores.values().filter(|&&v| v > 0).count() as u64;
+
+            // Single human-friendly message:
+            //   [route] <prefill|decode> <worker_id>/dp<n> req=<id_or_->
+            //     | isl=<n>t/<n>b cached=<n> new=<n> max_overlap=<n> nws=<n>
+            //     | active=<n>r <n>c <n>u
+            //     | logit=<f> cap=<n_or_->
+            // `t` = tokens, `b` = blocks; `r/c/u` = active
+            // requests / cached blocks / uncached blocks.
+            // `max_overlap` is the best overlap (in blocks) any worker
+            // had for this prefix — comparing to `cached` gives the
+            // load-balancing regret. `nws` is the count of workers that
+            // had non-zero overlap.
+            let req_disp = match &request.maybe_request_id {
+                Some(s) => s.as_str(),
+                None => "-",
+            };
+            let cap_disp: String = match kv_blocks_total {
+                Some(v) => v.to_string(),
+                None => "-".to_string(),
+            };
+            tracing::info!(
+                target: ROUTER_DECISION_TARGET,
+                "[route] {wt} {wid}/dp{dp} req={req} | isl={isl}t/{rb}b cached={rc} new={ru} max_overlap={mo} nws={nws} | active={ar}r {ac}c {au}u | logit={logit:.3} cap={cap}",
+                wt = self.slots.worker_type(),
+                wid = selection.worker.worker_id,
+                dp = selection.worker.dp_rank,
+                req = req_disp,
+                isl = request.isl_tokens,
+                rb = request_blocks,
+                rc = request_cached_blocks,
+                ru = request_uncached_blocks,
+                mo = max_overlap_blocks,
+                nws = n_workers_seen,
+                ar = active_count,
+                ac = active_cached,
+                au = active_uncached,
+                logit = selection.logit,
+                cap = cap_disp,
+            );
+        }
 
         request.respond(Ok(SchedulingResponse {
             best_worker: selection.worker,
@@ -177,6 +269,7 @@ impl SchedulerQueue {
             .add_request(SequenceRequest {
                 request_id: request_id.clone(),
                 token_sequence: request.token_seq,
+                local_hashes: request.local_hashes,
                 isl: request.isl_tokens,
                 overlap: selection.overlap_blocks,
                 expected_output_tokens: None,

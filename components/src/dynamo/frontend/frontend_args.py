@@ -76,6 +76,8 @@ class FrontendConfig(ConfigBase):
     metrics_prefix: Optional[str] = None
 
     kserve_grpc_server: bool
+    trtllm_grpc_server: bool
+    trtllm_grpc_port: int
     grpc_metrics_port: int
     dump_config_to: Optional[str]
 
@@ -95,6 +97,15 @@ class FrontendConfig(ConfigBase):
         if self.migration_limit < 0 or self.migration_limit > 4294967295:
             raise ValueError(
                 "--migration-limit must be between 0 and 4294967295 (0=disabled)"
+            )
+        if self.kserve_grpc_server and self.trtllm_grpc_server:
+            raise ValueError(
+                "--kserve-grpc-server and --trtllm-grpc-server are mutually "
+                "exclusive; pick one gRPC server contract per frontend instance"
+            )
+        if self.trtllm_grpc_server and not (1 <= self.trtllm_grpc_port <= 65535):
+            raise ValueError(
+                "--trtllm-grpc-port must be in [1, 65535]"
             )
 
 
@@ -478,6 +489,31 @@ class FrontendArgGroup(ArgGroup):
             env_var="DYN_KSERVE_GRPC_SERVER",
             default=False,
             help="Start KServe gRPC server.",
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--trtllm-grpc-server",
+            env_var="DYN_TRTLLM_GRPC_SERVER",
+            default=False,
+            help=(
+                "Start the TrtllmService gRPC server. This exposes the same gRPC "
+                "contract Together's TRT-LLM/vLLM/SGLang engines speak, so external "
+                "routers like Shepherd Model Gateway (SMG) can drive this Dynamo "
+                "instance with pre-tokenized input. Mutually exclusive with "
+                "--kserve-grpc-server."
+            ),
+        )
+        add_argument(
+            g,
+            flag_name="--trtllm-grpc-port",
+            env_var="DYN_TRTLLM_GRPC_PORT",
+            default=9001,
+            help=(
+                "gRPC port for the TrtllmService server (u16). Only used with "
+                "--trtllm-grpc-server. Defaults to 9001 to align with SMG's "
+                "default --worker-base-port convention."
+            ),
+            arg_type=int,
         )
         add_argument(
             g,

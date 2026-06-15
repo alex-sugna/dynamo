@@ -588,7 +588,47 @@ impl ModelManager {
         // Get of create runtime config watcher for this endpoint
         let workers_with_configs = self.get_or_create_runtime_config_watcher(endpoint).await?;
 
-        let selector = Box::new(DefaultWorkerSelector::new(kv_router_config));
+        // [decode-load-balance] In PD disagg, KV is transferred fresh from
+        // prefill to decode on every request, so prefix-overlap-based scoring
+        // on the decode side is a no-op: the decode-side radix tree never
+        // accumulates relevant overlap. Force overlap_score_weight=0 for the
+        // decode scheduler so its logit reduces to pure active-block load
+        // balancing across (worker_id, dp_rank). Prefill is unaffected.
+        let kv_router_config = if worker_type
+            == crate::protocols::common::timing::WORKER_TYPE_DECODE
+        {
+            let mut cfg = kv_router_config.unwrap_or_default();
+            cfg.overlap_score_weight = 0.0;
+            tracing::info!(
+                worker_type,
+                overlap_score_weight = cfg.overlap_score_weight,
+                "[route-cfg] decode chooser using load-only logit (overlap weight forced to 0)"
+            );
+            Some(cfg)
+        } else {
+            tracing::info!(
+                worker_type,
+                overlap_score_weight = kv_router_config
+                    .map(|c| c.overlap_score_weight)
+                    .unwrap_or(1.0),
+                "[route-cfg] {worker_type} chooser using configured overlap weight"
+            );
+            kv_router_config
+        };
+
+        // v2 admission filter: when DYN_ADMISSION_MAX_ACTIVE_UNCACHED_BLOCKS_PER_WORKER
+        // and/or the (role-specific or legacy) per-worker inflight cap is
+        // set, wrap the default logit selector with per-worker filtering.
+        // With nothing set, returns the inner selector unwrapped (zero cost).
+        // `worker_type` selects the role-specific inflight env var
+        // (DYN_ADMISSION_MAX_INFLIGHT_PER_PREFILL_WORKER /
+        // DYN_ADMISSION_MAX_INFLIGHT_PER_DECODE_WORKER); falls back to
+        // DYN_ADMISSION_MAX_INFLIGHT_PER_WORKER when the role-specific
+        // knob is unset.
+        let selector = crate::admission::TogetherSelector::from_env(
+            Box::new(DefaultWorkerSelector::new(kv_router_config)),
+            worker_type,
+        );
         let chooser = KvRouter::new(
             endpoint.clone(),
             client,
