@@ -495,6 +495,22 @@ class Publisher:
                 except Exception as e:
                     logging.warning(f"Failed to log iteration stats: {e}")
 
+            # Surface per-iteration latency to the worker log so a downstream
+            # log-scraping metrics exporter can pick it up. The iteration stats
+            # from get_latest_iteration_stats() are not reachable outside this
+            # process, so emit the field here. Rate-limited to ~1/s to bound
+            # log volume.
+            try:
+                iter_latency_ms = stat.get("iterLatencyMS")
+                now = time.time()
+                if (iter_latency_ms is not None
+                        and now - getattr(self, "_iter_stats_emit_ts", 0.0) >= 1.0):
+                    self._iter_stats_emit_ts = now
+                    logging.info("iteration_stats={iter_latency_ms=%s}"
+                                 % iter_latency_ms)
+            except Exception as e:
+                logging.warning("iteration_stats emit failed: %s" % e)
+
         await self._polling_loop(
             lambda: self.engine.llm.get_stats_async(timeout=_STATS_TIMEOUT_SEC),
             handle_stat,
