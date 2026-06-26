@@ -345,8 +345,18 @@ async def init_llm_worker(
     logging.info(f"TensorRT-LLM engine args: {arg_map}")
     engine_args = arg_map
 
-    # Populate default sampling params from the model
-    tokenizer = tokenizer_factory(arg_map["model"])
+    # Populate default sampling params from the model.
+    # When a custom tokenizer is configured (e.g. glm_moe_dsa for GLM-5.2, whose
+    # checkpoint declares an SMG-internal tokenizer_class that stock AutoTokenizer
+    # cannot load), build it the same way the TRT-LLM engine does instead of
+    # falling back to tokenizer_factory/AutoTokenizer.
+    custom_tokenizer = arg_map.get("custom_tokenizer")
+    if custom_tokenizer:
+        from tensorrt_llm.tokenizer import load_custom_tokenizer
+
+        tokenizer = load_custom_tokenizer(custom_tokenizer, arg_map["model"])
+    else:
+        tokenizer = tokenizer_factory(arg_map["model"])
     default_sampling_params = SamplingParams()
 
     # Enable perf metrics so prompt_tokens_details can be returned
