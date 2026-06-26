@@ -534,9 +534,24 @@ impl ModelWatcher {
                 };
 
                 let chat_engine = if let Some(engine) = factory_engine {
-                    engine
+                    Some(engine)
                 } else {
-                    entrypoint::build_routed_pipeline::<
+                    // Building the chat pipeline parses the model's chat_template
+                    // through minijinja. Some templates (e.g. GLM-4.6 / GLM-5.2) use
+                    // constructs minijinja rejects (e.g. "unexpected float, expected
+                    // identifier"). A chat_template parse failure must NOT tear down
+                    // the whole frontend:
+                    //   * In --trtllm-grpc-server mode SMG owns chat templating and the
+                    //     gRPC plane only ever uses the completions engine (see
+                    //     grpc/service/trtllm.rs), so the chat engine is dead weight here.
+                    //   * Even on the OpenAI HTTP path, degrading one model to
+                    //     completions-only beats killing the process.
+                    // Critically, the kv_chooser created above holds the runtime's
+                    // primary token and cancels it on Drop (see KvRouter::drop). If this
+                    // error unwinds, kv_chooser is dropped before it is committed to the
+                    // WorkerSet, cancelling the primary token and shutting the whole
+                    // runtime down. So log + skip the chat engine instead of propagating.
+                    match entrypoint::build_routed_pipeline::<
                         NvCreateChatCompletionRequest,
                         NvCreateChatCompletionStreamResponse,
                     >(
@@ -553,10 +568,25 @@ impl ModelWatcher {
                         self.metrics.clone(),
                     )
                     .await
-                    .context("build_routed_pipeline")?
+                    {
+                        Ok(engine) => Some(engine),
+                        Err(err) => {
+                            tracing::warn!(
+                                model_name = card.name(),
+                                namespace = mcid.namespace,
+                                error = format!("{err:#}"),
+                                "Failed to build chat-completions pipeline (likely an \
+                                 unsupported chat_template); serving this model without \
+                                 chat-completions. Completions / gRPC plane unaffected."
+                            );
+                            None
+                        }
+                    }
                 };
-                worker_set.chat_engine = Some(chat_engine);
-                tracing::info!("Chat completions is ready");
+                if let Some(chat_engine) = chat_engine {
+                    worker_set.chat_engine = Some(chat_engine);
+                    tracing::info!("Chat completions is ready");
+                }
             }
 
             // Add completions engine only if the model supports completions.
