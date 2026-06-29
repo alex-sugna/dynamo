@@ -198,4 +198,29 @@ mod tests {
         let result = remove_known_non_jinja2_tags(template);
         assert_eq!(result, "Start Part 1 middle Part 2");
     }
+
+    #[test]
+    fn test_new_rejects_malformed_chat_template() {
+        // Mirrors the GLM-4.6 / GLM-5.2 failure that crashed the discovery watcher:
+        // minijinja rejects the template at compile time (here, an unclosed `for`
+        // block). PromptFormatter::from_mdc -> from_parts -> this constructor must
+        // surface that as an Err so the watcher can degrade to completions-only
+        // instead of building a broken chat pipeline (or aborting registration).
+        let config: ChatTemplate =
+            serde_json::from_str(r#"{"chat_template": "{% for m in messages %}{{ m }}"}"#)
+                .expect("valid JSON");
+        let err = HfTokenizerConfigJsonFormatter::new(config, ContextMixins::default())
+            .expect_err("malformed chat_template must be rejected at construction");
+        assert!(!format!("{err:#}").is_empty());
+    }
+
+    #[test]
+    fn test_new_accepts_valid_chat_template() {
+        let config: ChatTemplate = serde_json::from_str(
+            r#"{"chat_template": "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}"}"#,
+        )
+        .expect("valid JSON");
+        HfTokenizerConfigJsonFormatter::new(config, ContextMixins::default())
+            .expect("valid chat_template should build");
+    }
 }

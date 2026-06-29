@@ -341,7 +341,19 @@ impl KvRouter {
         let kv_router_config = kv_router_config.unwrap_or_default();
         kv_router_config.validate()?;
         let component = endpoint.component();
-        let cancellation_token = component.drt().primary_token();
+        // Scope this router's cancellation token to a CHILD of the runtime's
+        // primary token, not the primary token itself. `Drop` (below) cancels this
+        // token; were it the primary token, dropping the last Arc<KvRouter> — a
+        // failed model registration unwinding, or a model being removed — would
+        // cancel the runtime-wide token and tear down the entire frontend. A child
+        // token is still cancelled when the runtime shuts down (parent -> child),
+        // but cancelling it on Drop affects only this router.
+        //
+        // NOTE: the scheduler/subscriber/indexer tasks spawned below still derive
+        // their tokens from `component` (runtime lifecycle), so they outlive an
+        // individual router drop until full shutdown. Scoping them to this child
+        // token too is a worthwhile follow-up but out of scope for this fix.
+        let cancellation_token = component.drt().primary_token().child_token();
 
         let indexer = Indexer::new(component, &kv_router_config, block_size);
 

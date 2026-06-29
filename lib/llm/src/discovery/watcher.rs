@@ -536,51 +536,73 @@ impl ModelWatcher {
                 let chat_engine = if let Some(engine) = factory_engine {
                     Some(engine)
                 } else {
-                    // Building the chat pipeline parses the model's chat_template
-                    // through minijinja. Some templates (e.g. GLM-4.6 / GLM-5.2) use
-                    // constructs minijinja rejects (e.g. "unexpected float, expected
-                    // identifier"). A chat_template parse failure must NOT tear down
-                    // the whole frontend:
-                    //   * In --trtllm-grpc-server mode SMG owns chat templating and the
-                    //     gRPC plane only ever uses the completions engine (see
-                    //     grpc/service/trtllm.rs), so the chat engine is dead weight here.
-                    //   * Even on the OpenAI HTTP path, degrading one model to
-                    //     completions-only beats killing the process.
-                    // Critically, the kv_chooser created above holds the runtime's
-                    // primary token and cancels it on Drop (see KvRouter::drop). If this
-                    // error unwinds, kv_chooser is dropped before it is committed to the
-                    // WorkerSet, cancelling the primary token and shutting the whole
-                    // runtime down. So log + skip the chat engine instead of propagating.
-                    match entrypoint::build_routed_pipeline::<
-                        NvCreateChatCompletionRequest,
-                        NvCreateChatCompletionStreamResponse,
-                    >(
-                        card,
-                        &client,
-                        self.manager.clone(),
-                        self.router_config.router_mode,
-                        worker_monitor.clone(),
-                        kv_chooser.clone(),
-                        tokenizer.clone(),
-                        prefill_chooser.clone(),
-                        self.router_config.decode_fallback,
-                        self.migration_limit,
-                        self.metrics.clone(),
-                    )
-                    .await
-                    {
-                        Ok(engine) => Some(engine),
+                    // The chat pipeline first parses the model's chat_template through
+                    // minijinja (PromptFormatter::from_mdc). Some templates (e.g.
+                    // GLM-4.6 / GLM-5.2) use constructs minijinja rejects ("unexpected
+                    // float, expected identifier"). ONLY that parse failure is treated as
+                    // non-fatal: we degrade this model to completions-only instead of
+                    // aborting, because
+                    //   * in --trtllm-grpc-server mode SMG owns chat templating and the
+                    //     gRPC plane only uses the completions engine (see
+                    //     grpc/service/trtllm.rs), so the chat engine is dead weight, and
+                    //   * on the OpenAI HTTP path, degrading one model to completions-only
+                    //     beats killing the process.
+                    // Every OTHER error (routing / KV / client / pipeline construction)
+                    // is a real bug and must surface, so we build the formatter
+                    // explicitly and send only its failure to the degrade path; the rest
+                    // goes through build_routed_pipeline_with_preprocessor with `?`.
+                    //
+                    // When chat is the only decode surface, degrading leaves the set with
+                    // no engine and the guard after this branch refuses to register it
+                    // (the discovery loop logs + skips a failed registration). Because
+                    // KvRouter now holds a child token (see KvRouter::new in
+                    // kv_router.rs), a propagated error no longer cancels the runtime-wide
+                    // primary token.
+                    let formatter = match PromptFormatter::from_mdc(card) {
+                        Ok(PromptFormatter::OAI(formatter)) => Some(formatter),
                         Err(err) => {
                             tracing::warn!(
                                 model_name = card.name(),
                                 namespace = mcid.namespace,
                                 error = format!("{err:#}"),
-                                "Failed to build chat-completions pipeline (likely an \
-                                 unsupported chat_template); serving this model without \
-                                 chat-completions. Completions / gRPC plane unaffected."
+                                "Failed to build chat-completions prompt formatter \
+                                 (likely an unsupported chat_template); will serve this \
+                                 model without chat-completions if another decode engine \
+                                 is available."
                             );
                             None
                         }
+                    };
+
+                    if let Some(formatter) = formatter {
+                        let preprocessor = OpenAIPreprocessor::new_with_parts(
+                            card.clone(),
+                            formatter,
+                            tokenizer.clone(),
+                        )
+                        .context("OpenAIPreprocessor::new_with_parts (chat)")?;
+                        let engine = entrypoint::build_routed_pipeline_with_preprocessor::<
+                            NvCreateChatCompletionRequest,
+                            NvCreateChatCompletionStreamResponse,
+                        >(
+                            card,
+                            &client,
+                            self.manager.clone(),
+                            self.router_config.router_mode,
+                            worker_monitor.clone(),
+                            kv_chooser.clone(),
+                            preprocessor,
+                            tokenizer.clone(),
+                            prefill_chooser.clone(),
+                            self.router_config.decode_fallback,
+                            self.migration_limit,
+                            self.metrics.clone(),
+                        )
+                        .await
+                        .context("build_routed_pipeline_with_preprocessor (chat)")?;
+                        Some(engine)
+                    } else {
+                        None
                     }
                 };
                 if let Some(chat_engine) = chat_engine {
@@ -617,6 +639,22 @@ impl ModelWatcher {
                 .context("build_routed_pipeline_with_preprocessor")?;
                 worker_set.completions_engine = Some(completions_engine);
                 tracing::info!("Completions is ready");
+            }
+
+            // A Tokens model that advertised chat and/or completions but built
+            // neither engine must NOT be registered. An engine-less WorkerSet is
+            // indistinguishable from a prefill set (WorkerSet::is_prefill_set) and
+            // would make the model advertise as available while every request fails.
+            // This happens when the chat_template fails to parse (chat degraded to
+            // None above) AND completions is not enabled. Fail registration instead;
+            // the discovery loop logs + skips it without taking down other models.
+            if !worker_set.has_decode_engine() {
+                anyhow::bail!(
+                    "Model '{}' (Tokens) advertises chat/completions but no decode \
+                     engine could be built (chat pipeline failed and completions is \
+                     not enabled); refusing to register an engine-less WorkerSet",
+                    card.name()
+                );
             }
         } else if card.model_input == ModelInput::Text && card.model_type.supports_embedding() {
             // Case: Text + Embeddings
