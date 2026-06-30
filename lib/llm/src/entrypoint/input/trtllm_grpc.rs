@@ -160,7 +160,7 @@ async fn run_watcher(
     namespace_filter: NamespaceFilter,
 ) -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
-    let watch_obj = ModelWatcher::new(
+    let mut watch_obj = ModelWatcher::new(
         runtime.clone(),
         model_manager,
         router_config,
@@ -168,6 +168,10 @@ async fn run_watcher(
         None,
         metrics,
     );
+    // SMG owns chat templating and serves chat via the completions plane, so
+    // Dynamo's own chat engine is optional here: an unparseable chat_template
+    // (e.g. GLM-5.2) must not fail registration in this mode.
+    watch_obj.set_chat_engine_optional(true);
     tracing::debug!("Waiting for remote model");
     let discovery = runtime.discovery();
     let discovery_stream = discovery

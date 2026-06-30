@@ -73,6 +73,11 @@ pub struct ModelWatcher {
     notify_on_model: Notify,
     model_update_tx: Option<Sender<ModelUpdate>>,
     chat_engine_factory: Option<ChatEngineFactoryCallback>,
+    /// When true (SMG / `--trtllm-grpc-server` mode), an unparseable chat_template
+    /// is non-fatal: Dynamo's own chat engine is dead weight there (SMG owns chat
+    /// templating and drives the completions plane), so it is skipped. When false
+    /// (plain OpenAI HTTP / KServe), a chat-build failure fails registration.
+    chat_engine_optional: bool,
     metrics: Arc<Metrics>,
     /// Guards against concurrent pipeline construction for the same (model, namespace).
     registering_worker_sets: DashSet<String>,
@@ -127,6 +132,7 @@ impl ModelWatcher {
             notify_on_model: Notify::new(),
             model_update_tx: None,
             chat_engine_factory,
+            chat_engine_optional: false,
             metrics,
             registering_worker_sets: DashSet::new(),
         }
@@ -134,6 +140,13 @@ impl ModelWatcher {
 
     pub fn set_notify_on_model_update(&mut self, tx: Sender<ModelUpdate>) {
         self.model_update_tx = Some(tx);
+    }
+
+    /// Mark Dynamo's own chat engine as optional (SMG / `--trtllm-grpc-server`
+    /// mode, where SMG serves chat via the completions plane). See the
+    /// `chat_engine_optional` field.
+    pub fn set_chat_engine_optional(&mut self, optional: bool) {
+        self.chat_engine_optional = optional;
     }
 
     /// Wait until we have at least one chat completions model and return it's name.
@@ -408,8 +421,8 @@ impl ModelWatcher {
     /// *compile* failure — the chat_template itself is unparseable — as opposed
     /// to a structural model-card problem (missing prompt_formatter, unreadable
     /// or corrupt tokenizer config, URL/file misconfig). Only the former is
-    /// treated as non-fatal (degrade to completions-only); everything else must
-    /// fail registration.
+    /// tolerated, and only in SMG mode (see `chat_engine_optional`); everything
+    /// else fails registration.
     fn is_chat_template_parse_error(err: &anyhow::Error) -> bool {
         err.chain()
             .any(|cause| cause.downcast_ref::<minijinja::Error>().is_some())
@@ -547,50 +560,38 @@ impl ModelWatcher {
                 let chat_engine = if let Some(engine) = factory_engine {
                     Some(engine)
                 } else {
-                    // The chat pipeline first parses the model's chat_template through
-                    // minijinja (PromptFormatter::from_mdc). Some templates (e.g.
-                    // GLM-4.6 / GLM-5.2) use constructs minijinja rejects ("unexpected
-                    // float, expected identifier"). ONLY that parse failure is treated as
-                    // non-fatal: we degrade this model to completions-only instead of
-                    // aborting, because
-                    //   * in --trtllm-grpc-server mode SMG owns chat templating and the
-                    //     gRPC plane only uses the completions engine (see
-                    //     grpc/service/trtllm.rs), so the chat engine is dead weight, and
-                    //   * on the OpenAI HTTP path, degrading one model to completions-only
-                    //     beats killing the process.
-                    // Every OTHER error (routing / KV / client / pipeline construction)
-                    // is a real bug and must surface, so we build the formatter
-                    // explicitly and send only its failure to the degrade path; the rest
-                    // goes through build_routed_pipeline_with_preprocessor with `?`.
-                    //
-                    // When chat is the only decode surface, degrading leaves the set with
-                    // no engine and the guard after this branch refuses to register it
-                    // (the discovery loop logs + skips a failed registration). Because
-                    // KvRouter now holds a child token (see KvRouter::new in
-                    // kv_router.rs), a propagated error no longer cancels the runtime-wide
-                    // primary token.
+                    // Building the chat pipeline parses the model's chat_template via
+                    // minijinja (PromptFormatter::from_mdc). Some templates (GLM-4.6 /
+                    // GLM-5.2) use constructs minijinja rejects ("unexpected float,
+                    // expected identifier"). Whether that is fatal depends on the mode:
+                    //   * SMG / --trtllm-grpc-server (chat_engine_optional): SMG owns
+                    //     chat templating and drives the completions plane (see
+                    //     grpc/service/trtllm.rs), so Dynamo's own chat engine is dead
+                    //     weight. Skip it (log) and let completions serve SMG.
+                    //   * Otherwise (plain OpenAI HTTP / KServe): chat is meant to be
+                    //     served here, so an unparseable chat_template is a hard failure —
+                    //     propagate it (fail registration) rather than silently degrade to
+                    //     completions-only.
+                    // Every non-template error (routing / KV / client / pipeline build)
+                    // propagates regardless of mode, so build the formatter explicitly
+                    // and route only its failure through this decision.
                     let formatter = match PromptFormatter::from_mdc(card) {
                         Ok(PromptFormatter::OAI(formatter)) => Some(formatter),
-                        // Only a minijinja template-*compile* failure is non-fatal:
-                        // degrade to completions-only. Any other from_mdc failure
-                        // (missing prompt_formatter, unreadable/corrupt tokenizer
-                        // config, URL/file misconfig) means the card is broken — fail
-                        // registration loudly instead of silently dropping chat.
-                        Err(err) if Self::is_chat_template_parse_error(&err) => {
+                        Err(err)
+                            if self.chat_engine_optional
+                                && Self::is_chat_template_parse_error(&err) =>
+                        {
                             tracing::warn!(
                                 model_name = card.name(),
                                 namespace = mcid.namespace,
                                 error = format!("{err:#}"),
-                                "Unsupported chat_template (minijinja parse failure); \
-                                 serving this model without chat-completions if another \
-                                 decode engine is available."
+                                "Unsupported chat_template; skipping Dynamo's chat engine \
+                                 (SMG/gRPC serves chat via the completions plane)."
                             );
                             None
                         }
                         Err(err) => {
-                            return Err(err).context(
-                                "build chat prompt formatter (non-template failure)",
-                            );
+                            return Err(err).context("build chat-completions prompt formatter");
                         }
                     };
 
