@@ -28,7 +28,9 @@ def test_prefers_native_loader():
         tok = load_custom_tokenizer_compat("glm_moe_dsa", "/models/glm")
 
     assert tok == "native-tok"
-    native.assert_called_once_with("glm_moe_dsa", "/models/glm")
+    native.assert_called_once_with(
+        "glm_moe_dsa", "/models/glm", trust_remote_code=False, use_fast=True
+    )
 
 
 def test_alias_table_dynamic_import_fallback():
@@ -48,7 +50,9 @@ def test_alias_table_dynamic_import_fallback():
         tok = load_custom_tokenizer_compat("glm_moe_dsa", "/models/glm")
 
     assert tok == "class-tok"
-    tok_cls.from_pretrained.assert_called_once_with("/models/glm")
+    tok_cls.from_pretrained.assert_called_once_with(
+        "/models/glm", trust_remote_code=False, use_fast=True
+    )
 
 
 def test_convention_resolves_bare_alias():
@@ -68,7 +72,9 @@ def test_convention_resolves_bare_alias():
         tok = load_custom_tokenizer_compat("deepseek_v32", "/models/ds")
 
     assert tok == "ds-tok"
-    tok_cls.from_pretrained.assert_called_once_with("/models/ds")
+    tok_cls.from_pretrained.assert_called_once_with(
+        "/models/ds", trust_remote_code=False, use_fast=True
+    )
 
 
 def test_fully_qualified_path():
@@ -88,7 +94,9 @@ def test_fully_qualified_path():
         tok = load_custom_tokenizer_compat("my.custom.module.CustomTok", "/m")
 
     assert tok == "fq-tok"
-    tok_cls.from_pretrained.assert_called_once_with("/m")
+    tok_cls.from_pretrained.assert_called_once_with(
+        "/m", trust_remote_code=False, use_fast=True
+    )
 
 
 def test_unresolvable_alias_raises_runtime_error():
@@ -182,3 +190,24 @@ def test_derives_use_fast_from_tokenizer_mode_for_native_loader():
 
     assert tok == "tok"
     assert received["use_fast"] is False
+
+
+def test_seeds_trust_remote_code_false_for_native_loader():
+    """Empty options -> native loader gets trust_remote_code=False (LLMArgs
+    default), overriding the native loader's own True default."""
+    received = {}
+
+    def fake_native(
+        tokenizer_identifier, model_dir, trust_remote_code=True, use_fast=True
+    ):
+        received.update(trust_remote_code=trust_remote_code, use_fast=use_fast)
+        return "tok"
+
+    native_mod = types.SimpleNamespace(load_custom_tokenizer=fake_native)
+
+    with mock.patch(_IMPORT_MODULE, return_value=native_mod):
+        tok = load_custom_tokenizer_compat("glm_moe_dsa", "/m")
+
+    assert tok == "tok"
+    assert received["trust_remote_code"] is False
+    assert received["use_fast"] is True

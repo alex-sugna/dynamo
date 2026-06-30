@@ -93,12 +93,16 @@ def load_custom_tokenizer_compat(
     than silently degrading to ``AutoTokenizer``.
     """
     options = dict(tokenizer_options or {})
-    # Derive use_fast from tokenizer_mode up-front so the setting is honored no
-    # matter which knob the target accepts — TRT-LLM's native loader (which may
-    # take use_fast directly) or HF from_pretrained. tokenizer_mode "slow" maps
-    # to use_fast=False (TRT-LLM/vLLM semantics).
-    if "use_fast" not in options and "tokenizer_mode" in options:
-        options["use_fast"] = options["tokenizer_mode"] != "slow"
+    # Seed the same effective defaults the TRT-LLM engine (LLMArgs / LLM) uses so
+    # the worker tokenizer matches it. Crucially, the native load_custom_tokenizer
+    # defaults trust_remote_code=True, but LLMArgs/LLM default False — without
+    # seeding, an omitted trust_remote_code would make the worker trust remote code
+    # while the engine does not (a security/behavior mismatch that can also mask
+    # engine-side tokenizer-load failures).
+    options.setdefault("trust_remote_code", False)
+    # tokenizer_mode "slow" -> use_fast=False; default ("auto"/"fast") -> True.
+    if "use_fast" not in options:
+        options["use_fast"] = options.get("tokenizer_mode", "auto") != "slow"
 
     native_loader = _resolve_native_custom_tokenizer_loader()
     if native_loader is not None:
