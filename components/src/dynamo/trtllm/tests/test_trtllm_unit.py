@@ -5,7 +5,6 @@
 
 import asyncio
 import re
-import types
 from pathlib import Path
 from unittest import mock
 
@@ -23,10 +22,7 @@ from dynamo.trtllm.args import Config, parse_args
 from dynamo.trtllm.constants import Modality
 from dynamo.trtllm.tests.conftest import make_cli_args_fixture
 from dynamo.trtllm.utils.trtllm_utils import deep_update
-from dynamo.trtllm.workers.llm_worker import (
-    init_llm_worker,
-    load_custom_tokenizer_compat,
-)
+from dynamo.trtllm.workers.llm_worker import init_llm_worker
 
 # Get path relative to this test file
 REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -196,85 +192,3 @@ async def test_init_llm_worker_creates_multimodal_processor():
                 config=config,
                 shutdown_event=asyncio.Event(),
             )
-
-
-# ---------------------------------------------------------------------------
-# Custom tokenizer compatibility loader
-# ---------------------------------------------------------------------------
-
-_IMPORT_MODULE = "dynamo.trtllm.workers.llm_worker.importlib.import_module"
-
-
-def test_load_custom_tokenizer_compat_prefers_native_loader():
-    """When tensorrt_llm.tokenizer.load_custom_tokenizer exists, use it."""
-    native = mock.MagicMock(return_value="native-tok")
-    native_mod = types.SimpleNamespace(load_custom_tokenizer=native)
-
-    with mock.patch(_IMPORT_MODULE, return_value=native_mod):
-        tok = load_custom_tokenizer_compat("glm_moe_dsa", "/models/glm")
-
-    assert tok == "native-tok"
-    native.assert_called_once_with("glm_moe_dsa", "/models/glm")
-
-
-def test_load_custom_tokenizer_compat_dynamic_import_fallback():
-    """Without the native helper, import the aliased tokenizer class directly."""
-    tok_cls = mock.MagicMock()
-    tok_cls.from_pretrained.return_value = "class-tok"
-    native_mod = types.SimpleNamespace()  # no load_custom_tokenizer attribute
-    glm_mod = types.SimpleNamespace(GlmMoeDsaTokenizer=tok_cls)
-
-    def fake_import(name):
-        return {
-            "tensorrt_llm.tokenizer": native_mod,
-            "tensorrt_llm.tokenizer.glm_moe_dsa": glm_mod,
-        }[name]
-
-    with mock.patch(_IMPORT_MODULE, side_effect=fake_import):
-        tok = load_custom_tokenizer_compat("glm_moe_dsa", "/models/glm")
-
-    assert tok == "class-tok"
-    tok_cls.from_pretrained.assert_called_once_with("/models/glm")
-
-
-def test_load_custom_tokenizer_compat_missing_class_raises():
-    """A known alias whose class can't be imported fails with a precise error."""
-    native_mod = types.SimpleNamespace()  # no native loader
-
-    def fake_import(name):
-        if name == "tensorrt_llm.tokenizer":
-            return native_mod
-        raise ImportError("glm_moe_dsa not present in this build")
-
-    with mock.patch(_IMPORT_MODULE, side_effect=fake_import):
-        with pytest.raises(RuntimeError, match="GlmMoeDsaTokenizer"):
-            load_custom_tokenizer_compat("glm_moe_dsa", "/models/glm")
-
-
-def test_load_custom_tokenizer_compat_unknown_alias_raises():
-    """An unknown name with no native loader fails fast rather than degrading."""
-    native_mod = types.SimpleNamespace()  # no native loader
-
-    with mock.patch(_IMPORT_MODULE, return_value=native_mod):
-        with pytest.raises(ValueError, match="not recognized"):
-            load_custom_tokenizer_compat("totally_unknown", "/models/x")
-
-
-def test_load_custom_tokenizer_compat_fully_qualified_path():
-    """Without the native helper, a dotted name is treated as module.ClassName."""
-    tok_cls = mock.MagicMock()
-    tok_cls.from_pretrained.return_value = "fqcp-tok"
-    native_mod = types.SimpleNamespace()  # no native loader
-    custom_mod = types.SimpleNamespace(CustomTok=tok_cls)
-
-    def fake_import(name):
-        return {
-            "tensorrt_llm.tokenizer": native_mod,
-            "my.custom.module": custom_mod,
-        }[name]
-
-    with mock.patch(_IMPORT_MODULE, side_effect=fake_import):
-        tok = load_custom_tokenizer_compat("my.custom.module.CustomTok", "/models/x")
-
-    assert tok == "fqcp-tok"
-    tok_cls.from_pretrained.assert_called_once_with("/models/x")

@@ -404,6 +404,17 @@ impl ModelWatcher {
         result
     }
 
+    /// True if `err` (from `PromptFormatter::from_mdc`) is a minijinja template
+    /// *compile* failure — the chat_template itself is unparseable — as opposed
+    /// to a structural model-card problem (missing prompt_formatter, unreadable
+    /// or corrupt tokenizer config, URL/file misconfig). Only the former is
+    /// treated as non-fatal (degrade to completions-only); everything else must
+    /// fail registration.
+    fn is_chat_template_parse_error(err: &anyhow::Error) -> bool {
+        err.chain()
+            .any(|cause| cause.downcast_ref::<minijinja::Error>().is_some())
+    }
+
     /// Build a complete WorkerSet with all engines for this (model, namespace)
     /// and add it to the Model.
     async fn do_worker_set_registration(
@@ -560,17 +571,26 @@ impl ModelWatcher {
                     // primary token.
                     let formatter = match PromptFormatter::from_mdc(card) {
                         Ok(PromptFormatter::OAI(formatter)) => Some(formatter),
-                        Err(err) => {
+                        // Only a minijinja template-*compile* failure is non-fatal:
+                        // degrade to completions-only. Any other from_mdc failure
+                        // (missing prompt_formatter, unreadable/corrupt tokenizer
+                        // config, URL/file misconfig) means the card is broken — fail
+                        // registration loudly instead of silently dropping chat.
+                        Err(err) if Self::is_chat_template_parse_error(&err) => {
                             tracing::warn!(
                                 model_name = card.name(),
                                 namespace = mcid.namespace,
                                 error = format!("{err:#}"),
-                                "Failed to build chat-completions prompt formatter \
-                                 (likely an unsupported chat_template); will serve this \
-                                 model without chat-completions if another decode engine \
-                                 is available."
+                                "Unsupported chat_template (minijinja parse failure); \
+                                 serving this model without chat-completions if another \
+                                 decode engine is available."
                             );
                             None
+                        }
+                        Err(err) => {
+                            return Err(err).context(
+                                "build chat prompt formatter (non-template failure)",
+                            );
                         }
                     };
 

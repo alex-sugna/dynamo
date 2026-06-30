@@ -8,7 +8,6 @@ LLM workers using TensorRT-LLM.
 """
 
 import asyncio
-import importlib
 import json
 import logging
 import os
@@ -58,6 +57,7 @@ from dynamo.trtllm.request_handlers.handlers import (
     RequestHandlerConfig,
     RequestHandlerFactory,
 )
+from dynamo.trtllm.utils.tokenizer_compat import load_custom_tokenizer_compat
 from dynamo.trtllm.utils.trtllm_utils import deep_update
 
 # Default buffer size for kv cache events.
@@ -179,76 +179,6 @@ def build_kv_connector_config(config: Config):
             logging.error(f"Invalid connector: {config.connector[0]}")
             sys.exit(1)
     return None
-
-
-# Custom-tokenizer aliases that TensorRT-LLM resolves internally. Kept here so
-# Dynamo can build the same tokenizer on TRT-LLM builds that ship the tokenizer
-# class but not the `load_custom_tokenizer` helper (e.g. fork `main` has the
-# class, rc14/glm52 has both). module -> attribute name of the tokenizer class.
-_CUSTOM_TOKENIZER_ALIASES = {
-    "glm_moe_dsa": ("tensorrt_llm.tokenizer.glm_moe_dsa", "GlmMoeDsaTokenizer"),
-}
-
-
-def _resolve_native_custom_tokenizer_loader():
-    """Return ``tensorrt_llm.tokenizer.load_custom_tokenizer`` if this TRT-LLM
-    build provides it, else ``None``. Resolved via importlib so it can be
-    exercised on builds that lack the module/helper without raising at import."""
-    try:
-        module = importlib.import_module("tensorrt_llm.tokenizer")
-    except ImportError:
-        return None
-    return getattr(module, "load_custom_tokenizer", None)
-
-
-def load_custom_tokenizer_compat(custom_tokenizer: str, tokenizer_path: str):
-    """Build a custom tokenizer by name, mirroring TRT-LLM's own loading.
-
-    A checkpoint may declare an SMG-internal ``tokenizer_class`` (e.g.
-    ``glm_moe_dsa`` for GLM-5.2) that stock ``AutoTokenizer`` cannot load. We
-    must build it the way the TRT-LLM engine does, and do so across builds:
-
-      1. Prefer ``tensorrt_llm.tokenizer.load_custom_tokenizer`` when present.
-      2. Otherwise dynamically import the tokenizer class itself using a local
-         alias table (some builds ship the class but not the helper).
-
-    Fails loudly with a precise message when the tokenizer implementation is
-    genuinely missing, instead of silently degrading to AutoTokenizer (which
-    cannot load these checkpoints and would surface as confusing errors later).
-    """
-    native_loader = _resolve_native_custom_tokenizer_loader()
-    if native_loader is not None:
-        return native_loader(custom_tokenizer, tokenizer_path)
-
-    spec = _CUSTOM_TOKENIZER_ALIASES.get(custom_tokenizer)
-    if spec is None:
-        # Not a known alias. TRT-LLM's custom_tokenizer contract also accepts a
-        # fully-qualified class path ("module.ClassName"); fork `main` resolves it
-        # that way in llm_args.py. Treat any dotted name as an import path and only
-        # fail if that import/lookup fails. A bare (dotless) name is neither.
-        if "." not in custom_tokenizer:
-            raise ValueError(
-                f"custom_tokenizer='{custom_tokenizer}' is not recognized. This "
-                "TensorRT-LLM build does not provide "
-                "tensorrt_llm.tokenizer.load_custom_tokenizer, and the value is "
-                f"neither a known alias ({sorted(_CUSTOM_TOKENIZER_ALIASES)}) nor "
-                "a fully-qualified module.ClassName import path."
-            )
-        spec = tuple(custom_tokenizer.rsplit(".", 1))
-
-    module_name, class_name = spec
-    try:
-        module = importlib.import_module(module_name)
-        tokenizer_cls = getattr(module, class_name)
-    except (ImportError, AttributeError) as exc:
-        raise RuntimeError(
-            f"custom_tokenizer='{custom_tokenizer}' requires {module_name}."
-            f"{class_name}, but it could not be imported ({exc}). Use a "
-            "TensorRT-LLM build that includes this tokenizer or remove "
-            "custom_tokenizer from the engine config."
-        ) from exc
-
-    return tokenizer_cls.from_pretrained(tokenizer_path)
 
 
 async def init_llm_worker(
@@ -424,9 +354,17 @@ async def init_llm_worker(
     custom_tokenizer = arg_map.get("custom_tokenizer")
     if custom_tokenizer:
         # Mirror TRT-LLM's llm_args: prefer an explicit `tokenizer` path,
-        # otherwise the model directory.
+        # otherwise the model directory, and forward tokenizer options so the
+        # worker tokenizer matches the engine's.
         tokenizer_path = arg_map.get("tokenizer") or arg_map["model"]
-        tokenizer = load_custom_tokenizer_compat(custom_tokenizer, tokenizer_path)
+        tokenizer_options = {
+            key: arg_map[key]
+            for key in ("trust_remote_code", "tokenizer_mode", "use_fast")
+            if key in arg_map
+        }
+        tokenizer = load_custom_tokenizer_compat(
+            custom_tokenizer, tokenizer_path, tokenizer_options
+        )
     else:
         tokenizer = tokenizer_factory(arg_map["model"])
     default_sampling_params = SamplingParams()
