@@ -68,16 +68,14 @@ def _supported_kwargs(func, options):
 
 
 def _hf_from_pretrained_kwargs(options):
-    """Translate TRT-LLM tokenizer options to HF ``from_pretrained`` kwargs."""
-    kwargs = {}
-    if "trust_remote_code" in options:
-        kwargs["trust_remote_code"] = options["trust_remote_code"]
-    if "use_fast" in options:
-        kwargs["use_fast"] = options["use_fast"]
-    elif "tokenizer_mode" in options:
-        # TRT-LLM/vLLM tokenizer_mode "slow" maps to HF use_fast=False.
-        kwargs["use_fast"] = options["tokenizer_mode"] != "slow"
-    return kwargs
+    """HF ``from_pretrained`` kwargs: it accepts ``trust_remote_code`` and
+    ``use_fast`` but not ``tokenizer_mode`` (``use_fast`` is derived up-front in
+    ``load_custom_tokenizer_compat``)."""
+    return {
+        key: options[key]
+        for key in ("trust_remote_code", "use_fast")
+        if key in options
+    }
 
 
 def load_custom_tokenizer_compat(
@@ -94,7 +92,13 @@ def load_custom_tokenizer_compat(
     Raises a precise error when the implementation is genuinely missing rather
     than silently degrading to ``AutoTokenizer``.
     """
-    options = tokenizer_options or {}
+    options = dict(tokenizer_options or {})
+    # Derive use_fast from tokenizer_mode up-front so the setting is honored no
+    # matter which knob the target accepts — TRT-LLM's native loader (which may
+    # take use_fast directly) or HF from_pretrained. tokenizer_mode "slow" maps
+    # to use_fast=False (TRT-LLM/vLLM semantics).
+    if "use_fast" not in options and "tokenizer_mode" in options:
+        options["use_fast"] = options["tokenizer_mode"] != "slow"
 
     native_loader = _resolve_native_custom_tokenizer_loader()
     if native_loader is not None:

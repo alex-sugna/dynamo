@@ -162,3 +162,23 @@ def test_forwards_options_to_from_pretrained_fallback():
     assert tok == "tok"
     assert received["trust_remote_code"] is True
     assert received["use_fast"] is False  # derived from tokenizer_mode="slow"
+
+
+def test_derives_use_fast_from_tokenizer_mode_for_native_loader():
+    """tokenizer_mode=slow yields use_fast=False even when the native loader takes
+    use_fast directly (not tokenizer_mode)."""
+    received = {}
+
+    def fake_native(custom_tokenizer, tokenizer_path, use_fast=True):
+        received["use_fast"] = use_fast
+        return "tok"
+
+    native_mod = types.SimpleNamespace(load_custom_tokenizer=fake_native)
+
+    with mock.patch(_IMPORT_MODULE, return_value=native_mod):
+        tok = load_custom_tokenizer_compat(
+            "glm_moe_dsa", "/m", {"tokenizer_mode": "slow"}
+        )
+
+    assert tok == "tok"
+    assert received["use_fast"] is False
