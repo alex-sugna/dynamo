@@ -22,15 +22,27 @@ use tokio::task::JoinHandle;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-/// Optional HTTP/2 window size configuration from environment variables.
+/// Default gRPC message size limit in bytes (256 MiB).
+///
+/// tonic's own default decoding limit is only 4 MiB, which is too small for the
+/// large token-id payloads exchanged on the trtllm/kserve paths (a long prompt
+/// can serialize to several MiB). This matches the SMG gRPC clients'
+/// `GRPC_DEFAULT_MAX_BYTES`, so the server accepts everything a client will send.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+
+/// Optional HTTP/2 tuning and message-size configuration from environment variables.
 ///
 /// # Environment Variables
 ///
 /// - `DYN_GRPC_INITIAL_CONNECTION_WINDOW_SIZE`: HTTP/2 connection window size in bytes
 /// - `DYN_GRPC_INITIAL_STREAM_WINDOW_SIZE`: HTTP/2 per-stream window size in bytes
+/// - `DYN_GRPC_MAX_MESSAGE_SIZE`: max decoded/encoded gRPC message size in bytes
+///   (defaults to `DEFAULT_MAX_MESSAGE_SIZE`)
 ///
-/// If set, these override tonic defaults. If not set, tonic defaults are used.
-#[derive(Debug, Clone, Default)]
+/// If set, the window-size vars override tonic defaults. If not set, tonic
+/// defaults are used for the windows and `DEFAULT_MAX_MESSAGE_SIZE` for the
+/// message size.
+#[derive(Debug, Clone)]
 pub struct GrpcTuningConfig {
     /// HTTP/2 connection-level flow control window size in bytes.
     /// If None, uses tonic default.
@@ -39,13 +51,28 @@ pub struct GrpcTuningConfig {
     /// HTTP/2 stream-level flow control window size in bytes.
     /// If None, uses tonic default.
     pub initial_stream_window_size: Option<u32>,
+
+    /// Maximum decoded/encoded gRPC message size in bytes.
+    pub max_message_size: usize,
+}
+
+impl Default for GrpcTuningConfig {
+    fn default() -> Self {
+        Self {
+            initial_connection_window_size: None,
+            initial_stream_window_size: None,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        }
+    }
 }
 
 impl GrpcTuningConfig {
     /// Create configuration from environment variables.
     ///
-    /// Reads `DYN_GRPC_INITIAL_CONNECTION_WINDOW_SIZE` and `DYN_GRPC_INITIAL_STREAM_WINDOW_SIZE`.
-    /// If not set, the values remain None and tonic defaults are used.
+    /// Reads `DYN_GRPC_INITIAL_CONNECTION_WINDOW_SIZE`, `DYN_GRPC_INITIAL_STREAM_WINDOW_SIZE`
+    /// and `DYN_GRPC_MAX_MESSAGE_SIZE`. If a window var is not set, its value remains
+    /// None and the tonic default is used; if the message-size var is not set,
+    /// `DEFAULT_MAX_MESSAGE_SIZE` is used.
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
@@ -59,6 +86,12 @@ impl GrpcTuningConfig {
             && let Ok(size) = val.parse::<u32>()
         {
             config.initial_stream_window_size = Some(size);
+        }
+
+        if let Ok(val) = std::env::var("DYN_GRPC_MAX_MESSAGE_SIZE")
+            && let Ok(size) = val.parse::<usize>()
+        {
+            config.max_message_size = size;
         }
 
         config
@@ -228,6 +261,10 @@ impl KserveService {
                 tuning.initial_stream_window_size
             );
         }
+        tracing::info!(
+            "gRPC max message size: {} bytes",
+            tuning.max_message_size
+        );
 
         let observer = cancel_token.child_token();
 
@@ -242,7 +279,11 @@ impl KserveService {
         }
 
         builder
-            .add_service(GrpcInferenceServiceServer::new(self.clone()))
+            .add_service(
+                GrpcInferenceServiceServer::new(self.clone())
+                    .max_decoding_message_size(tuning.max_message_size)
+                    .max_encoding_message_size(tuning.max_message_size),
+            )
             .serve_with_shutdown(address.parse()?, observer.cancelled_owned())
             .await
             .inspect_err(|_| cancel_token.cancel())?;

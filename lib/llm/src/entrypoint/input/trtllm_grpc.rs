@@ -124,10 +124,18 @@ pub async fn run(
     if let Some(size) = tuning.initial_stream_window_size {
         builder = builder.initial_stream_window_size(size);
     }
+    tracing::info!(
+        max_message_size = tuning.max_message_size,
+        "TrtllmService gRPC max message size"
+    );
 
     let shutdown_token = distributed_runtime.primary_token();
     let trtllm_server_fut = builder
-        .add_service(TrtllmServiceServer::new(trtllm_impl))
+        .add_service(
+            TrtllmServiceServer::new(trtllm_impl)
+                .max_decoding_message_size(tuning.max_message_size)
+                .max_encoding_message_size(tuning.max_message_size),
+        )
         .serve_with_shutdown(address.parse()?, {
             let token = shutdown_token.clone();
             async move { token.cancelled().await }
