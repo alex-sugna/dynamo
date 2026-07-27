@@ -95,6 +95,7 @@ async def create_profiling_server(
                 with_stack=data.get("with_stack", True),
                 record_shapes=data.get("record_shapes", False),
                 activities=data.get("activities", ["CPU", "CUDA"]),
+                all_ranks=data.get("all_ranks", False),
             )
             logging.info(f"Profiling started successfully: {result}")
             return web.json_response(result)
