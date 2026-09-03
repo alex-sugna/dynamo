@@ -5585,26 +5585,38 @@ impl OpenAIPreprocessor {
                     .expect("choice recovery buffer poisoned");
                 for choice in &mut data.inner.choices {
                     let state = recovery.entry(choice.index).or_default();
-                    let marker_start = crate::protocols::openai::chat_completions::unified_parser::unquoted_native_tool_call_marker_or_prefix_start(&state.input_text, "glm47");
-                    let desired_content = marker_start.map_or(state.input_text.as_str(), |start| {
-                        &state.input_text[..start]
-                    });
-                    let replacement = desired_content
-                        .strip_prefix(&state.emitted_text)
-                        .unwrap_or(desired_content);
-                    if choice.finish_reason
+                    if let Some(marker_start) = crate::protocols::openai::chat_completions::unified_parser::unquoted_native_tool_call_marker_or_prefix_start(&state.input_text, "glm47") {
+                        let desired_content = &state.input_text[..marker_start];
+                        let replacement = desired_content
+                            .strip_prefix(&state.emitted_text)
+                            .unwrap_or(desired_content);
+                        if choice.finish_reason
+                            == Some(dynamo_protocols::types::FinishReason::Length)
+                            && crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47").is_some()
+                        {
+                            tracing::warn!(
+                                choice_index = choice.index,
+                                suppressed_bytes = state.input_text.len() - desired_content.len(),
+                                "glm47 streaming: suppressing incomplete native tool output on length finish"
+                            );
+                        }
+                        choice.delta.content = (!replacement.is_empty())
+                            .then(|| ChatCompletionMessageContent::Text(replacement.to_string()));
+                    } else if choice.finish_reason
                         == Some(dynamo_protocols::types::FinishReason::Length)
-                        && crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47").is_some()
+                        && choice.delta.tool_calls.is_none()
                     {
-                        tracing::warn!(
-                            choice_index = choice.index,
-                            suppressed_bytes = state.input_text.len() - desired_content.len(),
-                            "glm47 streaming: suppressing incomplete native tool output on length finish"
-                        );
+                        let replacement = state
+                            .input_text
+                            .strip_prefix(&state.emitted_text)
+                            .unwrap_or(state.input_text.as_str());
+                        choice.delta.content = (!replacement.is_empty())
+                            .then(|| ChatCompletionMessageContent::Text(replacement.to_string()));
                     }
-                    choice.delta.content = (!replacement.is_empty())
-                        .then(|| ChatCompletionMessageContent::Text(replacement.to_string()));
-                    state.emitted_text.push_str(replacement);
+
+                    if let Some(ChatCompletionMessageContent::Text(content)) = &choice.delta.content {
+                        state.emitted_text.push_str(content);
+                    }
                 }
             }
 
