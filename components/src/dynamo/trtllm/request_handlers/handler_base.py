@@ -246,6 +246,49 @@ class HandlerBase(BaseGenerativeHandler):
             # Task was cancelled, which is expected when generation completes normally
             pass
 
+    def _abort_after_handler_exit(
+        self,
+        generation_result: Optional[GenerationResult],
+        request_id: str,
+        reason: str,
+    ) -> None:
+        """Best-effort engine abort when a submitted request exits abnormally.
+
+        The cancellation monitor covers a killed Dynamo context, but it is
+        deliberately cancelled when the handler exits. A validation error,
+        engine exception, empty non-terminal response, or generator close can
+        therefore otherwise strand the submitted TRT-LLM request after its
+        client has already received an error or disconnected.
+        """
+        if generation_result is None:
+            return
+        if self.disable_request_abort:
+            logging.warning(
+                "Engine abort skipped on handler exit because request abort is "
+                "disabled: request_id=%s trtllm_client_id=%s reason=%s",
+                request_id,
+                getattr(generation_result, "request_id", None),
+                reason,
+            )
+            return
+        try:
+            generation_result.abort()
+            logging.info(
+                "Engine abort on handler exit: request_id=%s "
+                "trtllm_client_id=%s reason=%s",
+                request_id,
+                getattr(generation_result, "request_id", None),
+                reason,
+            )
+        except Exception:
+            logging.exception(
+                "Engine abort failed on handler exit: request_id=%s "
+                "trtllm_client_id=%s reason=%s",
+                request_id,
+                getattr(generation_result, "request_id", None),
+                reason,
+            )
+
     @asynccontextmanager
     async def _cancellation_monitor(
         self, generation_result: GenerationResult, context: Context
@@ -821,6 +864,11 @@ class HandlerBase(BaseGenerativeHandler):
             f"engine_submit_at={engine_submit_at}"
         )
 
+        generation_result: Optional[GenerationResult] = None
+        engine_finished = False
+        handler_succeeded = False
+        abort_attempted = False
+
         try:
             # XP test hooks (env-gated, no-op when unset). Both target the
             # worker-side health-check bypass surface in
@@ -873,9 +921,20 @@ class HandlerBase(BaseGenerativeHandler):
                     message_hashes=message_hashes,
                 )
 
+            logging.info(
+                "Engine ID map: request_id=%s trtllm_client_id=%s disagg_request_id=%s",
+                context.id(),
+                getattr(generation_result, "request_id", None),
+                disaggregated_params.disagg_request_id
+                if disaggregated_params
+                else None,
+            )
+
             # Monitor for cancellation triggers and cancel by calling generation_result.abort()
             async with self._cancellation_monitor(generation_result, context):
                 async for res in generation_result:
+                    if res.finished:
+                        engine_finished = True
                     # TRTLLM engine needs to start generating tokens first before stats
                     # can be retrieved.
                     if self.first_generation and self.publisher:
@@ -1055,6 +1114,13 @@ class HandlerBase(BaseGenerativeHandler):
                             f"python_processing_ms={(_pd_yield_at - trtllm_returns_disagg_params_at) * 1000:.3f}"
                         )
 
+                    # Mark success only after all response validation and
+                    # encoding completed. Do this before yielding the final
+                    # chunk because a downstream consumer may close the async
+                    # generator immediately after receiving it.
+                    if res.finished:
+                        handler_succeeded = True
+
                     # Yield the chunk to the client and update the token count for the next iteration.
                     yield out
                     num_output_tokens_so_far = next_total_toks
@@ -1062,11 +1128,18 @@ class HandlerBase(BaseGenerativeHandler):
         # 1. Client cancellation - don't shutdown
         except asyncio.CancelledError:
             logging.debug(f"Request {request_id}: Client cancelled")
-            # _cancellation_monitor already called abort_request
+            self._abort_after_handler_exit(
+                generation_result, request_id, "handler_cancelled"
+            )
+            abort_attempted = True
             return  # Just stop, no error response
 
         # 2. Per-request errors - send to client, don't shutdown
         except RequestError as e:
+            self._abort_after_handler_exit(
+                generation_result, request_id, "request_error"
+            )
+            abort_attempted = True
             # RequestError carries an HTTP `code` class attribute (see
             # tensorrt_llm.executor.utils): 400 for InvalidRequestError
             # (validation), 500 for plain RequestError (engine-side fault —
@@ -1085,6 +1158,10 @@ class HandlerBase(BaseGenerativeHandler):
 
         # 3. ALL OTHER ERRORS - graceful shutdown
         except Exception as e:
+            self._abort_after_handler_exit(
+                generation_result, request_id, f"{type(e).__name__}"
+            )
+            abort_attempted = True
             error_type = type(e).__name__
             error_msg = str(e)
             logging.error(
@@ -1103,6 +1180,17 @@ class HandlerBase(BaseGenerativeHandler):
 
             # Initiate graceful shutdown
             await self._initiate_shutdown(e)
+
+        finally:
+            if (
+                generation_result is not None
+                and not handler_succeeded
+                and not abort_attempted
+            ):
+                reason = (
+                    "engine_incomplete" if not engine_finished else "handler_failed"
+                )
+                self._abort_after_handler_exit(generation_result, request_id, reason)
 
     @staticmethod
     def _override_sampling_params(sampling_params, request: dict) -> SamplingParams:

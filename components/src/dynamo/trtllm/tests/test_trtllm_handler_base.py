@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-from contextlib import asynccontextmanager
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest import mock
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -370,3 +370,118 @@ class TestHandleCancellationAbortToggle:
         await handler._handle_cancellation(generation_result, context)
 
         generation_result.abort.assert_not_called()
+
+
+class TestAbortAfterHandlerExit:
+    """Abnormal handler exits must not strand a submitted engine request."""
+
+    def _make_handler(self, disable_request_abort: bool = False) -> HandlerBase:
+        config = MagicMock()
+        config.disable_request_abort = disable_request_abort
+        config.shutdown_event = None
+        return _ConcreteHandler(config)
+
+    def test_aborts_submitted_request(self, caplog):
+        caplog.set_level(logging.INFO)
+        handler = self._make_handler()
+        generation_result = MagicMock()
+        generation_result.request_id = 73
+
+        handler._abort_after_handler_exit(
+            generation_result, "external-request", "ValueError"
+        )
+
+        generation_result.abort.assert_called_once_with()
+        assert "request_id=external-request" in caplog.text
+        assert "trtllm_client_id=73" in caplog.text
+
+    def test_honors_abort_disable_flag(self, caplog):
+        handler = self._make_handler(disable_request_abort=True)
+        generation_result = MagicMock()
+        generation_result.request_id = 91
+
+        handler._abort_after_handler_exit(
+            generation_result, "external-request", "handler_cancelled"
+        )
+
+        generation_result.abort.assert_not_called()
+        assert "request abort is disabled" in caplog.text
+
+    def test_abort_failure_is_contained(self, caplog):
+        handler = self._make_handler()
+        generation_result = MagicMock()
+        generation_result.request_id = 99
+        generation_result.abort.side_effect = RuntimeError("abort failed")
+
+        handler._abort_after_handler_exit(
+            generation_result, "external-request", "request_error"
+        )
+
+        assert "Engine abort failed on handler exit" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_malformed_prefill_response_aborts_submitted_request(self):
+        config = SimpleNamespace(
+            engine=SimpleNamespace(llm=MagicMock()),
+            default_sampling_params=MockSamplingParams(),
+            publisher=None,
+            metrics_collector=None,
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            encode_client=None,
+            multimodal_processor=None,
+            connector=None,
+            runtime=None,
+            kv_block_size=32,
+            shutdown_event=None,
+            disable_request_abort=False,
+        )
+        handler = _ConcreteHandler(config)
+        handler._normalize_request_format = MagicMock()
+        handler._setup_disaggregated_params_for_mode = MagicMock(
+            return_value=(SimpleNamespace(disagg_request_id=None), None, {}, None)
+        )
+        handler._prepare_input_for_generation = AsyncMock(
+            return_value={"prompt_token_ids": [1, 2, 3]}
+        )
+        handler._initiate_shutdown = AsyncMock()
+
+        output = SimpleNamespace(
+            token_ids=[42],
+            logprobs=None,
+            finish_reason=None,
+            stop_reason=None,
+            request_perf_metrics=None,
+            disaggregated_params=SimpleNamespace(
+                ctx_request_id=None,
+                first_gen_tokens=None,
+                opaque_state=None,
+            ),
+        )
+        result = SimpleNamespace(
+            outputs=[output],
+            finished=True,
+            cached_tokens=None,
+        )
+        generation_result = MagicMock()
+        generation_result.request_id = 73
+        generation_result.__aiter__.return_value = [result]
+        config.engine.llm.generate_async.return_value = generation_result
+
+        context = MagicMock()
+        never_cancelled = asyncio.get_event_loop().create_future()
+        context.async_killed_or_stopped.return_value = never_cancelled
+        context.id.return_value = "external-request"
+        request = {
+            "token_ids": [1, 2, 3],
+            "stop_conditions": {"max_tokens": 8},
+            "sampling_options": {},
+            "extra_args": {"request_id": "external-request"},
+        }
+
+        chunks = [chunk async for chunk in handler.generate_locally(request, context)]
+
+        generation_result.abort.assert_called_once_with()
+        handler._initiate_shutdown.assert_awaited_once()
+        assert chunks[-1]["finish_reason"]["error"].startswith(
+            "TRT-LLM returned invalid disaggregated_params"
+        )
