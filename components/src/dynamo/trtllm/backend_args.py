@@ -150,7 +150,20 @@ class DynamoTrtllmArgGroup(ArgGroup):
             flag_name="--publish-events-and-metrics",
             env_var="DYN_TRTLLM_PUBLISH_EVENTS_AND_METRICS",
             default=False,
-            help="If set, publish events and metrics to Dynamo components.",
+            help=(
+                "Publish KV-cache events and TensorRT-LLM performance metrics. "
+                "Use --publish-metrics when the router does not consume KV events."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--publish-metrics",
+            env_var="DYN_TRTLLM_PUBLISH_METRICS",
+            default=False,
+            help=(
+                "Publish TensorRT-LLM performance metrics without constructing "
+                "or publishing the KV-event stream."
+            ),
         )
         add_negatable_bool_argument(
             g,
@@ -460,6 +473,7 @@ class DynamoTrtllmConfig(ConfigBase):
     extra_engine_args: str
     override_engine_args: str
     publish_events_and_metrics: bool
+    publish_metrics: bool
     disable_request_abort: bool
     guided_decoding_backend: Optional[str] = None
 

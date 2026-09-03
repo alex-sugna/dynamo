@@ -114,6 +114,18 @@ def test_config_use_kv_events_derived_from_publish_events(monkeypatch):
     assert config_off.use_kv_events is False
 
 
+def test_publish_metrics_does_not_enable_kv_events(monkeypatch):
+    """Metrics-only mode must not construct the unused TRT-LLM KV event path."""
+    monkeypatch.delenv("DYN_TRTLLM_PUBLISH_EVENTS_AND_METRICS", raising=False)
+    monkeypatch.delenv("DYN_TRTLLM_PUBLISH_METRICS", raising=False)
+
+    config = parse_args(["--publish-metrics"])
+
+    assert config.publish_metrics is True
+    assert config.publish_events_and_metrics is False
+    assert config.use_kv_events is False
+
+
 def test_config_has_connector(monkeypatch):
     """Config.has_connector returns True only for the single configured connector."""
     monkeypatch.delenv("DYN_CONNECTOR", raising=False)
