@@ -13,8 +13,10 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
+use tokio::sync::{Mutex, RwLock};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
@@ -56,15 +58,122 @@ pub use trtllm::trtllm_service_server::{TrtllmService, TrtllmServiceServer};
 #[derive(Clone)]
 pub struct TrtllmServiceImpl {
     state: Arc<State>,
+    health: Arc<TrtllmHealthState>,
+}
+
+/// Shared state for the SMG-facing health RPC.
+///
+/// A recently generated token proves the full serving path is making progress,
+/// while `probe_lock` prevents concurrent Kubernetes/i-router checks from
+/// stampeding the scheduler with synthetic requests.
+#[derive(Default)]
+struct TrtllmHealthState {
+    last_generated_token: RwLock<Option<Instant>>,
+    probe_lock: Mutex<()>,
 }
 
 impl TrtllmServiceImpl {
     pub fn new(state: Arc<State>) -> Self {
-        Self { state }
+        Self {
+            state,
+            health: Arc::new(TrtllmHealthState::default()),
+        }
     }
 
     pub fn state(&self) -> &State {
         Arc::as_ref(&self.state)
+    }
+
+    async fn recent_generated_token(&self) -> Option<Duration> {
+        self.health
+            .last_generated_token
+            .read()
+            .await
+            .as_ref()
+            .map(Instant::elapsed)
+    }
+
+    async fn run_health_probe(&self) -> Result<(), Status> {
+        let request_id = format!(
+            "HEALTH_CHECK_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let request = health_probe_request(request_id);
+        let mut stream = <Self as TrtllmService>::generate(self, Request::new(request))
+            .await?
+            .into_inner();
+
+        while let Some(item) = stream.next().await {
+            let response = item?;
+            if response_has_generated_token(&response) {
+                return Ok(());
+            }
+        }
+
+        Err(Status::unavailable(
+            "health probe completed without generating a token",
+        ))
+    }
+}
+
+const E2E_HEALTH_CHECK_TIMEOUT_ENV: &str = "DYN_E2E_HEALTH_CHECK_TIMEOUT";
+const E2E_LAST_HEALTHY_TIMEOUT_ENV: &str = "DYN_E2E_LAST_HEALTHY_TIMEOUT";
+const DEFAULT_E2E_HEALTH_CHECK_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_E2E_LAST_HEALTHY_TIMEOUT_SECS: u64 = 30;
+
+fn duration_from_env(name: &str, default_secs: u64) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(default_secs))
+}
+
+fn health_probe_request(request_id: String) -> trtllm::GenerateRequest {
+    trtllm::GenerateRequest {
+        request_id,
+        tokenized: Some(trtllm::TokenizedInput {
+            original_text: String::new(),
+            input_token_ids: vec![0],
+            query_token_ids: vec![],
+        }),
+        sampling_config: None,
+        output_config: None,
+        max_tokens: 1,
+        streaming: true,
+        guided_decoding: None,
+        embedding_bias: vec![],
+        lora_config: None,
+        prompt_tuning_config: None,
+        multimodal_input: None,
+        kv_cache_retention: None,
+        disaggregated_params: None,
+        lookahead_config: None,
+        cache_salt_id: None,
+        arrival_time: None,
+        stop: vec![],
+        stop_token_ids: vec![],
+        ignore_eos: false,
+        bad: vec![],
+        bad_token_ids: vec![],
+        include_stop_token_in_output: false,
+        message_hashes: vec![],
+        backend_instance_id: None,
+        decode_instance_id: None,
+        ..Default::default()
+    }
+}
+
+fn response_has_generated_token(response: &trtllm::GenerateResponse) -> bool {
+    match response.response.as_ref() {
+        Some(trtllm::generate_response::Response::Chunk(chunk)) => !chunk.token_ids.is_empty(),
+        Some(trtllm::generate_response::Response::Complete(complete)) => {
+            complete.completion_tokens > 0 || !complete.output_token_ids.is_empty()
+        }
+        None => false,
     }
 }
 
@@ -255,6 +364,7 @@ impl TrtllmService for TrtllmServiceImpl {
         // handled separately via `engine_error_str_to_status`.
         let (stream, _parsing_options) =
             completion_response_stream(self.state.clone(), nv_request).await?;
+        let health_state = self.health.clone();
 
         // Stream loop:
         //
@@ -331,6 +441,13 @@ impl TrtllmService for TrtllmServiceImpl {
                 let chunk_token_ids = response_translation::extract_token_ids(&nv_chunk);
                 let chunk_token_count = chunk_token_ids.len() as u32;
                 cumulative_token_ids.extend_from_slice(&chunk_token_ids);
+
+                // Only a real generated token counts as progress. In
+                // particular, annotation, error, and usage-only frames must
+                // not make /health_generate report a wedged engine healthy.
+                if chunk_token_count > 0 {
+                    *health_state.last_generated_token.write().await = Some(Instant::now());
+                }
 
                 // Same accumulator pattern for raw logprobs. Each delta
                 // carries its slice via nvext.raw_logprobs; we append
@@ -418,13 +535,59 @@ impl TrtllmService for TrtllmServiceImpl {
         &self,
         _request: Request<trtllm::HealthCheckRequest>,
     ) -> Result<Response<trtllm::HealthCheckResponse>, Status> {
-        // Frontend is "healthy" when at least one model is registered with the
-        // ModelManager (i.e. a worker has joined via etcd discovery). The HTTP
-        // path uses the same readiness signal in `check_ready`.
-        let ready = !self.state.manager().model_display_names().is_empty();
-        let status = if ready { "OK" } else { "NOT_READY" };
+        if self.state.manager().model_display_names().is_empty() {
+            return Ok(Response::new(trtllm::HealthCheckResponse {
+                status: "NOT_READY: no model registered".to_string(),
+            }));
+        }
+
+        let recent_timeout = duration_from_env(
+            E2E_LAST_HEALTHY_TIMEOUT_ENV,
+            DEFAULT_E2E_LAST_HEALTHY_TIMEOUT_SECS,
+        );
+        if self
+            .recent_generated_token()
+            .await
+            .is_some_and(|age| age < recent_timeout)
+        {
+            return Ok(Response::new(trtllm::HealthCheckResponse {
+                status: "OK".to_string(),
+            }));
+        }
+
+        // Serialize probes. Callers waiting behind an in-flight probe recheck
+        // its progress marker before submitting another one.
+        let _guard = self.health.probe_lock.lock().await;
+        if self
+            .recent_generated_token()
+            .await
+            .is_some_and(|age| age < recent_timeout)
+        {
+            return Ok(Response::new(trtllm::HealthCheckResponse {
+                status: "OK".to_string(),
+            }));
+        }
+
+        let probe_timeout = duration_from_env(
+            E2E_HEALTH_CHECK_TIMEOUT_ENV,
+            DEFAULT_E2E_HEALTH_CHECK_TIMEOUT_SECS,
+        );
+        let status = match tokio::time::timeout(probe_timeout, self.run_health_probe()).await {
+            Ok(Ok(())) => "OK".to_string(),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "SMG-facing engine health probe failed");
+                // SMG historically classified status by substring, so keep
+                // arbitrary backend text (which could contain "healthy") out
+                // of the wire verdict.
+                "NOT_READY: engine probe failed".to_string()
+            }
+            Err(_) => format!(
+                "NOT_READY: engine made no progress within {}s",
+                probe_timeout.as_secs()
+            ),
+        };
         Ok(Response::new(trtllm::HealthCheckResponse {
-            status: status.to_string(),
+            status,
         }))
     }
 
@@ -1002,6 +1165,30 @@ mod tests {
             include_stop_token_in_output: false,
             message_hashes: vec![],
         }
+    }
+
+    #[test]
+    fn health_probe_requires_a_generated_token() {
+        let request = health_probe_request("health-1".to_string());
+        assert_eq!(request.max_tokens, 1);
+        assert_eq!(request.tokenized.unwrap().input_token_ids, vec![0]);
+
+        let empty = trtllm::GenerateResponse {
+            request_id: "health-1".to_string(),
+            response: None,
+        };
+        assert!(!response_has_generated_token(&empty));
+
+        let token = trtllm::GenerateResponse {
+            request_id: "health-1".to_string(),
+            response: Some(trtllm::generate_response::Response::Chunk(
+                trtllm::GenerateStreamChunk {
+                    token_ids: vec![42],
+                    ..Default::default()
+                },
+            )),
+        };
+        assert!(response_has_generated_token(&token));
     }
 
     #[test]
