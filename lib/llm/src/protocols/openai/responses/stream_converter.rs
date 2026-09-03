@@ -158,7 +158,11 @@ impl ResponseStreamConverter {
             None => {
                 // Resumed reasoning proves pending tool calls completed, even if
                 // this chunk reports that the new reasoning exhausted the budget.
-                self.append_pending_function_call_done_events(events, OutputStatus::Completed);
+                self.append_pending_function_call_done_events(
+                    events,
+                    OutputStatus::Completed,
+                    false,
+                );
 
                 let output_index = self.next_output_index;
                 self.next_output_index += 1;
