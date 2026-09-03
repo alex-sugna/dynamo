@@ -63,12 +63,12 @@ pub struct TrtllmServiceImpl {
 
 /// Shared state for the SMG-facing health RPC.
 ///
-/// A recently generated token proves the full serving path is making progress,
-/// while `probe_lock` prevents concurrent Kubernetes/i-router checks from
-/// stampeding the scheduler with synthetic requests.
+/// A recently completed two-token generation proves the full serving path is
+/// making progress, while `probe_lock` prevents concurrent Kubernetes/i-router
+/// checks from stampeding the scheduler with synthetic requests.
 #[derive(Default)]
 struct TrtllmHealthState {
-    last_generated_token: RwLock<Option<Instant>>,
+    last_completed_generation: RwLock<Option<Instant>>,
     probe_lock: Mutex<()>,
 }
 
@@ -84,9 +84,9 @@ impl TrtllmServiceImpl {
         Arc::as_ref(&self.state)
     }
 
-    async fn recent_generated_token(&self) -> Option<Duration> {
+    async fn recent_completed_generation(&self) -> Option<Duration> {
         self.health
-            .last_generated_token
+            .last_completed_generation
             .read()
             .await
             .as_ref()
@@ -108,13 +108,13 @@ impl TrtllmServiceImpl {
 
         while let Some(item) = stream.next().await {
             let response = item?;
-            if response_has_generated_token(&response) {
+            if response_is_completed_generation(&response, MIN_HEALTH_COMPLETION_TOKENS) {
                 return Ok(());
             }
         }
 
         Err(Status::unavailable(
-            "health probe completed without generating a token",
+            "health probe completed without a full two-token generation",
         ))
     }
 }
@@ -123,6 +123,7 @@ const E2E_HEALTH_CHECK_TIMEOUT_ENV: &str = "DYN_E2E_HEALTH_CHECK_TIMEOUT";
 const E2E_LAST_HEALTHY_TIMEOUT_ENV: &str = "DYN_E2E_LAST_HEALTHY_TIMEOUT";
 const DEFAULT_E2E_HEALTH_CHECK_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_E2E_LAST_HEALTHY_TIMEOUT_SECS: u64 = 30;
+const MIN_HEALTH_COMPLETION_TOKENS: usize = 2;
 
 fn duration_from_env(name: &str, default_secs: u64) -> Duration {
     std::env::var(name)
@@ -142,7 +143,10 @@ fn health_probe_request(request_id: String) -> trtllm::GenerateRequest {
         }),
         sampling_config: None,
         output_config: None,
-        max_tokens: 1,
+        // In PD mode the prefill worker can emit the first generated token.
+        // Requiring two tokens and draining through the terminal Complete frame
+        // proves decode progress and avoids cancelling decode mid-handoff.
+        max_tokens: MIN_HEALTH_COMPLETION_TOKENS as u32,
         streaming: true,
         guided_decoding: None,
         embedding_bias: vec![],
@@ -156,7 +160,7 @@ fn health_probe_request(request_id: String) -> trtllm::GenerateRequest {
         arrival_time: None,
         stop: vec![],
         stop_token_ids: vec![],
-        ignore_eos: false,
+        ignore_eos: true,
         bad: vec![],
         bad_token_ids: vec![],
         include_stop_token_in_output: false,
@@ -167,13 +171,16 @@ fn health_probe_request(request_id: String) -> trtllm::GenerateRequest {
     }
 }
 
-fn response_has_generated_token(response: &trtllm::GenerateResponse) -> bool {
+fn response_is_completed_generation(
+    response: &trtllm::GenerateResponse,
+    min_completion_tokens: usize,
+) -> bool {
     match response.response.as_ref() {
-        Some(trtllm::generate_response::Response::Chunk(chunk)) => !chunk.token_ids.is_empty(),
         Some(trtllm::generate_response::Response::Complete(complete)) => {
-            complete.completion_tokens > 0 || !complete.output_token_ids.is_empty()
+            (complete.completion_tokens as usize) >= min_completion_tokens
+                || complete.output_token_ids.len() >= min_completion_tokens
         }
-        None => false,
+        Some(trtllm::generate_response::Response::Chunk(_)) | None => false,
     }
 }
 
@@ -442,13 +449,6 @@ impl TrtllmService for TrtllmServiceImpl {
                 let chunk_token_count = chunk_token_ids.len() as u32;
                 cumulative_token_ids.extend_from_slice(&chunk_token_ids);
 
-                // Only a real generated token counts as progress. In
-                // particular, annotation, error, and usage-only frames must
-                // not make /health_generate report a wedged engine healthy.
-                if chunk_token_count > 0 {
-                    *health_state.last_generated_token.write().await = Some(Instant::now());
-                }
-
                 // Same accumulator pattern for raw logprobs. Each delta
                 // carries its slice via nvext.raw_logprobs; we append
                 // them to the cumulative buffer in arrival order so the
@@ -507,6 +507,13 @@ impl TrtllmService for TrtllmServiceImpl {
                     nvext: None,
                 },
             });
+            // Do not cache health from the first PD token: prefill can emit it
+            // before decode makes any progress. Only a fully drained request
+            // with at least two output tokens proves the end-to-end path.
+            if cumulative_token_ids.len() >= MIN_HEALTH_COMPLETION_TOKENS {
+                *health_state.last_completed_generation.write().await = Some(Instant::now());
+            }
+
             yield response_translation::nv_response_to_complete(
                 &request_id,
                 &final_chunk,
@@ -546,7 +553,7 @@ impl TrtllmService for TrtllmServiceImpl {
             DEFAULT_E2E_LAST_HEALTHY_TIMEOUT_SECS,
         );
         if self
-            .recent_generated_token()
+            .recent_completed_generation()
             .await
             .is_some_and(|age| age < recent_timeout)
         {
@@ -559,7 +566,7 @@ impl TrtllmService for TrtllmServiceImpl {
         // its progress marker before submitting another one.
         let _guard = self.health.probe_lock.lock().await;
         if self
-            .recent_generated_token()
+            .recent_completed_generation()
             .await
             .is_some_and(|age| age < recent_timeout)
         {
@@ -1168,27 +1175,52 @@ mod tests {
     }
 
     #[test]
-    fn health_probe_requires_a_generated_token() {
+    fn health_probe_requires_a_completed_two_token_generation() {
         let request = health_probe_request("health-1".to_string());
-        assert_eq!(request.max_tokens, 1);
+        assert_eq!(request.max_tokens, 2);
+        assert!(request.ignore_eos);
         assert_eq!(request.tokenized.unwrap().input_token_ids, vec![0]);
 
         let empty = trtllm::GenerateResponse {
             request_id: "health-1".to_string(),
             response: None,
         };
-        assert!(!response_has_generated_token(&empty));
+        assert!(!response_is_completed_generation(&empty, 2));
 
-        let token = trtllm::GenerateResponse {
+        let token_chunk = trtllm::GenerateResponse {
             request_id: "health-1".to_string(),
             response: Some(trtllm::generate_response::Response::Chunk(
                 trtllm::GenerateStreamChunk {
-                    token_ids: vec![42],
+                    token_ids: vec![42, 43],
                     ..Default::default()
                 },
             )),
         };
-        assert!(response_has_generated_token(&token));
+        assert!(!response_is_completed_generation(&token_chunk, 2));
+
+        let one_token_complete = trtllm::GenerateResponse {
+            request_id: "health-1".to_string(),
+            response: Some(trtllm::generate_response::Response::Complete(
+                trtllm::GenerateComplete {
+                    completion_tokens: 1,
+                    output_token_ids: vec![42],
+                    ..Default::default()
+                },
+            )),
+        };
+        assert!(!response_is_completed_generation(&one_token_complete, 2));
+
+        let two_token_complete = trtllm::GenerateResponse {
+            request_id: "health-1".to_string(),
+            response: Some(trtllm::generate_response::Response::Complete(
+                trtllm::GenerateComplete {
+                    completion_tokens: 2,
+                    output_token_ids: vec![42, 43],
+                    ..Default::default()
+                },
+            )),
+        };
+        assert!(response_is_completed_generation(&two_token_complete, 2));
     }
 
     #[test]
