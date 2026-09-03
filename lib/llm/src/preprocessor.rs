@@ -5416,9 +5416,14 @@ impl OpenAIPreprocessor {
             emitted_text: String,
         }
         let is_glm47 = tool_call_parser.as_deref() == Some("glm47");
+        let glm47_config = dynamo_parsers::tool_calling::config::Glm47ParserConfig::default();
+        let glm47_start = glm47_config.tool_call_start;
+        let glm47_end = glm47_config.tool_call_end;
         let choice_recovery: Arc<Mutex<std::collections::HashMap<u32, ChoiceRecovery>>> =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
         let choice_recovery_in = Arc::clone(&choice_recovery);
+        let glm47_start_in = glm47_start.clone();
+        let glm47_end_in = glm47_end.clone();
 
         // The jail's own (vendored, out-of-scope) finalize logic cannot tell an
         // error-terminated input stream from one that genuinely completed — it
@@ -5487,11 +5492,25 @@ impl OpenAIPreprocessor {
                 for choice in &data.inner.choices {
                     if let Some(ChatCompletionMessageContent::Text(content)) = &choice.delta.content
                     {
-                        recovery
-                            .entry(choice.index)
-                            .or_default()
-                            .input_text
-                            .push_str(content);
+                        let state = recovery.entry(choice.index).or_default();
+                        state.input_text.push_str(content);
+                        // A completed call is already owned by the jail. Retain only
+                        // the suffix after it, so terminal recovery examines the
+                        // final unfinished call while the shared scanner decides
+                        // whether each opener is real or quoted prose.
+                        while let Some(marker_start) = crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47") {
+                            let after_marker =
+                                &state.input_text[marker_start + glm47_start_in.len()..];
+                            let Some(end) = after_marker.find(&glm47_end_in) else {
+                                break;
+                            };
+                            state.input_text.drain(
+                                ..marker_start
+                                    + glm47_start_in.len()
+                                    + end
+                                    + glm47_end_in.len(),
+                            );
+                        }
                     }
                 }
             }
@@ -5587,15 +5606,18 @@ impl OpenAIPreprocessor {
                     let state = recovery.entry(choice.index).or_default();
                     if let Some(marker_start) = crate::protocols::openai::chat_completions::unified_parser::unquoted_native_tool_call_marker_or_prefix_start(&state.input_text, "glm47") {
                         let desired_content = &state.input_text[..marker_start];
-                        let replacement = desired_content
-                            .strip_prefix(&state.emitted_text)
-                            .unwrap_or(desired_content);
-                        if choice.finish_reason
+                        let replacement = if desired_content.starts_with(&state.emitted_text) {
+                            &desired_content[state.emitted_text.len()..]
+                        } else {
+                            desired_content
+                        };
+                        let suppressing_terminal_marker = choice.finish_reason
                             == Some(dynamo_protocols::types::FinishReason::Length)
-                            && crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47").is_some()
-                        {
+                            && crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47").is_some();
+                        if suppressing_terminal_marker {
                             tracing::warn!(
                                 choice_index = choice.index,
+                                why = "truncated_native_tool_call_suppressed",
                                 suppressed_bytes = state.input_text.len() - desired_content.len(),
                                 "glm47 streaming: suppressing incomplete native tool output on length finish"
                             );
@@ -7611,6 +7633,32 @@ mod tests {
                 "split at byte {split} must not expose truncated marker content"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn glm47_streaming_length_keeps_an_empty_safe_terminal_recovery_delta() {
+        let output = apply_glm47_streaming_length(&[
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+        ])
+        .await;
+
+        assert!(stream_content(&output).is_empty());
+        let terminal_choices: Vec<_> = output
+            .iter()
+            .flat_map(|response| response.data.iter())
+            .flat_map(|data| data.inner.choices.iter())
+            .filter(|choice| choice.finish_reason == Some(FinishReason::Length))
+            .collect();
+        assert_eq!(
+            terminal_choices.len(),
+            1,
+            "the recovery event must be observable"
+        );
+        assert!(
+            terminal_choices[0].delta.content.is_none()
+                && terminal_choices[0].delta.tool_calls.is_none(),
+            "the observable recovery delta must not expose raw markup or partial arguments"
+        );
     }
 
     async fn apply_kimi_k3_no_tools(
