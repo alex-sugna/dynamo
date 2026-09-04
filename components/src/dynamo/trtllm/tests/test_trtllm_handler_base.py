@@ -421,11 +421,16 @@ class TestAbortAfterHandlerExit:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("finish_reason", "is_malformed"),
-        [(None, True), ("cancelled", False)],
+        ("finish_reason", "context_stopped", "context_killed", "is_malformed"),
+        [
+            (None, False, False, True),
+            ("cancelled", False, False, False),
+            ("length", False, True, False),
+            ("length", True, False, False),
+        ],
     )
     async def test_prefill_response_without_pd_state(
-        self, finish_reason, is_malformed
+        self, finish_reason, context_stopped, context_killed, is_malformed
     ):
         config = SimpleNamespace(
             engine=SimpleNamespace(llm=MagicMock()),
@@ -477,6 +482,8 @@ class TestAbortAfterHandlerExit:
         never_cancelled = asyncio.get_event_loop().create_future()
         context.async_killed_or_stopped.return_value = never_cancelled
         context.id.return_value = "external-request"
+        context.is_stopped.return_value = context_stopped
+        context.is_killed.return_value = context_killed
         request = {
             "token_ids": [1, 2, 3],
             "stop_conditions": {"max_tokens": 8},

@@ -993,19 +993,40 @@ class HandlerBase(BaseGenerativeHandler):
                         # complete and decode is not needed. Skip the
                         # disagg_params validation and let the prefill-only
                         # response flow back to the client.
+                        # A stream-drop cancellation can race the engine's
+                        # terminal prefill response. In that race TRT-LLM may
+                        # report its pre-abort finish reason (for example
+                        # ``length``) after abort has already removed the PD
+                        # state. The request context is the authoritative
+                        # serving-layer lifecycle signal: never validate or
+                        # forward a handoff after its consumer has stopped.
+                        context_stopped = context.is_stopped()
+                        context_killed = context.is_killed()
+                        context_cancelled = context_stopped or context_killed
+                        prefill_cancelled = (
+                            output.finish_reason == "cancelled" or context_cancelled
+                        )
+                        if prefill_cancelled:
+                            out["finish_reason"] = "cancelled"
+
                         terminal_in_prefill = (
-                            output.finish_reason == "cancelled"
+                            prefill_cancelled
                             or (
                                 output.finish_reason in ("stop", "eos", "end_id")
                                 and not prefill_disagg
                             )
                         )
 
-                        if output.finish_reason == "cancelled":
+                        if prefill_cancelled:
                             logging.info(
                                 "Prefill request %s was cancelled before PD handoff; "
-                                "disaggregated_params will not be forwarded",
+                                "engine_finish_reason=%s context_stopped=%s "
+                                "context_killed=%s; disaggregated_params will not be "
+                                "forwarded",
                                 request_id,
+                                output.finish_reason,
+                                context_stopped,
+                                context_killed,
                             )
 
                         if not terminal_in_prefill:
