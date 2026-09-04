@@ -15,11 +15,11 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use super::{CallHomeHandshake, ControlMessage, TcpStreamConnectionInfo};
 use crate::engine::AsyncEngineContext;
 use crate::pipeline::network::{
-    ConnectionInfo, ResponseStreamPrologue, StreamSender,
     codec::{TwoPartCodec, TwoPartMessage},
     tcp::StreamType,
+    ConnectionInfo, ResponseStreamPrologue, StreamSender,
 };
-use anyhow::{Context, Result, anyhow as error}; // Import SinkExt to use the `send` method
+use anyhow::{anyhow as error, Context, Result}; // Import SinkExt to use the `send` method
 
 #[allow(dead_code)]
 pub struct TcpClient {
@@ -250,9 +250,15 @@ async fn handle_reader(
                         }
                     }
                     Some(Err(e)) => {
-                        // TODO(#171) - address fatal errors
-                        // in this case the binary representation of the message is invalid
-                        panic!("fatal error - failed to decode message from stream; invalid line protocol: {e:?}");
+                        // A reset or protocol error makes only this response
+                        // stream unusable. Kill its engine context so the
+                        // request is cancelled, then let both connection tasks
+                        // shut down without panicking the Tokio worker.
+                        tracing::warn!(
+                            "tcp stream read error, closing connection: {e:?}"
+                        );
+                        context.kill();
+                        break;
                     }
                     None => {
                         tracing::debug!("tcp stream closed by server");
@@ -333,7 +339,7 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt;
     use std::sync::Arc;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::codec::FramedRead;
@@ -962,6 +968,40 @@ mod tests {
         assert!(
             controller.is_killed(),
             "Controller should be killed after receiving Kill message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_reader_kills_context_on_stream_error() {
+        let ReaderHarness {
+            framed_server,
+            framed_reader,
+            alive_tx,
+            alive_rx: _alive_rx,
+            controller,
+        } = reader_harness().await;
+
+        let controller_clone = controller.clone();
+        let reader_handle =
+            tokio::spawn(
+                async move { handle_reader(framed_reader, controller_clone, alive_tx).await },
+            );
+
+        // Leave a partial TwoPartCodec header buffered at EOF. decode_eof
+        // reports this as a stream error, matching a truncated/reset response.
+        let mut raw_writer = framed_server.into_inner();
+        raw_writer.write_all(&[0u8; 8]).await.unwrap();
+        raw_writer.shutdown().await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), reader_handle).await;
+        assert!(result.is_ok(), "reader must terminate after a stream error");
+        assert!(
+            result.unwrap().is_ok(),
+            "reader should return its stream rather than panic"
+        );
+        assert!(
+            controller.is_killed(),
+            "Controller should be killed after a TCP stream read error"
         );
     }
 }
