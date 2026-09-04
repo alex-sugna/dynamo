@@ -420,7 +420,13 @@ class TestAbortAfterHandlerExit:
         assert "Engine abort failed on handler exit" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_malformed_prefill_response_aborts_submitted_request(self):
+    @pytest.mark.parametrize(
+        ("finish_reason", "is_malformed"),
+        [(None, True), ("cancelled", False)],
+    )
+    async def test_prefill_response_without_pd_state(
+        self, finish_reason, is_malformed
+    ):
         config = SimpleNamespace(
             engine=SimpleNamespace(llm=MagicMock()),
             default_sampling_params=MockSamplingParams(),
@@ -448,7 +454,7 @@ class TestAbortAfterHandlerExit:
         output = SimpleNamespace(
             token_ids=[42],
             logprobs=None,
-            finish_reason=None,
+            finish_reason=finish_reason,
             stop_reason=None,
             request_perf_metrics=None,
             disaggregated_params=SimpleNamespace(
@@ -480,8 +486,14 @@ class TestAbortAfterHandlerExit:
 
         chunks = [chunk async for chunk in handler.generate_locally(request, context)]
 
-        generation_result.abort.assert_called_once_with()
-        handler._initiate_shutdown.assert_awaited_once()
-        assert chunks[-1]["finish_reason"]["error"].startswith(
-            "TRT-LLM returned invalid disaggregated_params"
-        )
+        if is_malformed:
+            generation_result.abort.assert_called_once_with()
+            handler._initiate_shutdown.assert_awaited_once()
+            assert chunks[-1]["finish_reason"]["error"].startswith(
+                "TRT-LLM returned invalid disaggregated_params"
+            )
+        else:
+            generation_result.abort.assert_not_called()
+            handler._initiate_shutdown.assert_not_awaited()
+            assert chunks[-1]["finish_reason"] == "cancelled"
+            assert "disaggregated_params" not in chunks[-1]

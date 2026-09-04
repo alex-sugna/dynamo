@@ -994,9 +994,17 @@ class HandlerBase(BaseGenerativeHandler):
                         # disagg_params validation and let the prefill-only
                         # response flow back to the client.
                         terminal_in_prefill = (
-                            output.finish_reason in ("stop", "eos", "end_id")
+                            output.finish_reason
+                            in ("stop", "eos", "end_id", "cancelled")
                             and not prefill_disagg
                         )
+
+                        if output.finish_reason == "cancelled" and not prefill_disagg:
+                            logging.info(
+                                "Prefill request %s was cancelled before PD handoff; "
+                                "no disaggregated_params are expected",
+                                request_id,
+                            )
 
                         if not terminal_in_prefill:
                             # Validate disaggregated_params before returning
